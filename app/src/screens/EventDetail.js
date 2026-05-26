@@ -132,6 +132,7 @@ setIsVerifiedOrganizer(
             });
         } else if (event?.organizerName) {
             setHostName(event.organizerName);
+            setIsVerifiedOrganizer(false);
         }
     }, [event]);
 
