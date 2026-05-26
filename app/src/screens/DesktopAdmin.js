@@ -35,7 +35,13 @@ export default function DesktopAdmin() {
     const approveClub = async (clubId, ownerId) => {
         try {
             // 1. Update Firestore
-            await updateDoc(doc(db, 'clubs', clubId), { approved: true });
+            await updateDoc(doc(db, 'clubs', clubId), {
+    approved: true,
+    verificationStatus: 'verified',
+});
+await updateDoc(doc(db, 'users', ownerId), {
+    verificationStatus: 'verified',
+});
 
             // 2. Call Backend to Set Role
             if (user && ownerId) {
@@ -110,7 +116,7 @@ export default function DesktopAdmin() {
                                     <Text style={styles.cell}>{club.name}</Text>
                                     <Text style={styles.cell}>{club.ownerUserId}</Text>
                                     <Text style={styles.cell}>
-                                        {club.approved ? 'Approved' : 'Pending'}
+                                       {club.verificationStatus === 'verified' ? 'Verified' : 'Pending'}
                                     </Text>
                                     <View style={styles.cell}>
                                         {!club.approved && (

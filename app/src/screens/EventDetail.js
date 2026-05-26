@@ -97,6 +97,7 @@ export default function EventDetail({ route, navigation }) {
         }
     };
     const [hostName, setHostName] = useState('Organizer');
+    const [isVerifiedOrganizer, setIsVerifiedOrganizer] = useState(false);
     const [reminderId, setReminderId] = useState(null); // Firestore Doc ID if set
     const [isBookmarked, setIsBookmarked] = useState(false);
 
@@ -115,7 +116,15 @@ export default function EventDetail({ route, navigation }) {
         if (event?.ownerId) {
             getDoc(doc(db, 'users', event.ownerId)).then(snap => {
                 if (snap.exists()) {
-                    setHostName(snap.data().displayName || event.organizerName || 'Organizer');
+                    const userData = snap.data();
+
+setHostName(
+    userData.displayName || event.organizerName || 'Organizer'
+);
+
+setIsVerifiedOrganizer(
+    userData.verificationStatus === 'verified'
+);
                 }
             });
         } else if (event?.organizerName) {
@@ -1400,9 +1409,20 @@ export default function EventDetail({ route, navigation }) {
                                 >
                                     Hosted by
                                 </Text>
-                                <Text style={[styles.hostName, { color: theme.colors.text }]}>
-                                    {hostName}
-                                </Text>
+                               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+    <Text style={[styles.hostName, { color: theme.colors.text }]}>
+        {hostName}
+    </Text>
+
+    {isVerifiedOrganizer && (
+        <Ionicons
+            name="checkmark-circle"
+            size={18}
+            color="#3B82F6"
+            style={{ marginLeft: 6 }}
+        />
+    )}
+</View>
                             </View>
                             <Ionicons
                                 name="chevron-forward"
