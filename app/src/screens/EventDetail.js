@@ -125,7 +125,10 @@ setHostName(
 setIsVerifiedOrganizer(
     userData.verificationStatus === 'verified'
 );
-                }
+                } else {
+  setHostName(event.organizerName || 'Organizer');
+  setIsVerifiedOrganizer(false);
+}
             });
         } else if (event?.organizerName) {
             setHostName(event.organizerName);
