@@ -144,7 +144,7 @@ export default function EventDetail({ route, navigation }) {
     setHostName('Organizer');
     setIsVerifiedOrganizer(false);
   }
-}, [event]);
+}, [event?.ownerId, event?.organizerName]);
 
     // Increment View Count (Unique per User)
     useEffect(() => {
