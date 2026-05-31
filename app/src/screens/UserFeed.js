@@ -302,7 +302,6 @@ export default function UserFeed() {
                 snapshot.forEach(doc => {
                     const data = doc.data();
                     if (data.status === 'suspended') return;
-                    if (data.deletedAt != null) return;
                     list.push({ id: doc.id, ...data });
                 });
                 setEvents(list);
@@ -454,7 +453,6 @@ export default function UserFeed() {
             snapshot.forEach(doc => {
                 const data = doc.data();
                 if (data.status === 'suspended') return;
-                if (data.deletedAt != null) return;
                 list.push({ id: doc.id, ...data });
             });
             setEvents(list);

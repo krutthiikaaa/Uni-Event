@@ -31,7 +31,6 @@ if (admin.apps.length === 0) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
 app.use(cors({ origin: true }));
 app.use(express.json());
 
@@ -65,7 +64,7 @@ const rateLimitMiddleware = async (req: express.Request, res: express.Response, 
   try {
     const isEventCreation = req.path === '/api/createEvent';
     const limitResult = await checkAndUpdateRateLimit(user.uid, isEventCreation);
-
+    
     if (!limitResult.allowed) {
       return res.status(limitResult.statusCode).json({
         error: 'too-many-requests',

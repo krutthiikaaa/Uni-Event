@@ -1,11 +1,10 @@
 import * as admin from "firebase-admin";
 import * as functions from "firebase-functions";
 import { FieldValue, FieldPath } from 'firebase-admin/firestore';
-import { enforceAppCheck } from "./middleware/appCheck";
 
 // Initialize only once (important for tests + Firebase runtime)
 if (!admin.apps.length) {
-    admin.initializeApp();
+  admin.initializeApp();
 }
 
 const db = admin.firestore();
@@ -17,11 +16,11 @@ const db = admin.firestore();
  * - Reminder: 1 point each
  */
 export const calculatePoints = (
-    attendanceCount: number,
-    registrationCount: number,
-    remindersSet: number,
+  attendanceCount: number,
+  registrationCount: number,
+  remindersSet: number,
 ) => {
-    return attendanceCount * 10 + registrationCount * 2 + remindersSet;
+  return attendanceCount * 10 + registrationCount * 2 + remindersSet;
 };
 
 /**
@@ -39,8 +38,6 @@ export const calculateReputation = functions.https.onCall(async (_data, context)
             'Only admin can calculate reputation.',
         );
     }
-
-    enforceAppCheck(context);
 
     const usersSnapshot = await db.collection('users').get();
     let batch = db.batch();
@@ -62,7 +59,7 @@ export const calculateReputation = functions.https.onCall(async (_data, context)
             attendanceCount,
             registrationCount,
             remindersSet,
-        );
+            );
         batch.update(userDoc.ref, {
             'reputation.points': points,
             'reputation.attendanceCount': attendanceCount,
@@ -141,7 +138,6 @@ export const getTopContributors = functions.https.onCall(async (data, context) =
     if (!context.auth) {
         throw new functions.https.HttpsError('unauthenticated', 'The function must be called while authenticated.');
     }
-    enforceAppCheck(context);
     const limit = Math.min(data?.limit || 10, 25);
     const lastPoints = data?.lastPoints;
     const lastUserId = data?.lastUserId;
@@ -183,10 +179,10 @@ export const getTopContributors = functions.https.onCall(async (data, context) =
         hasMore: contributors.length === limit,
         nextCursor: lastContributor
             ? {
-                lastPoints: lastContributor.points,
-                lastUserId: lastContributor.userId,
-                startRank: startRank + contributors.length,
-            }
+                  lastPoints: lastContributor.points,
+                  lastUserId: lastContributor.userId,
+                  startRank: startRank + contributors.length,
+              }
             : null,
     };
 });
