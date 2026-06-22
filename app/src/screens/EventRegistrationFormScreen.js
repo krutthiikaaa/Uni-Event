@@ -7,38 +7,34 @@ import {
     TouchableOpacity,
     Alert,
     ActivityIndicator,
+    Dimensions,
+    KeyboardAvoidingView,
+    Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import ScreenWrapper from '../components/ScreenWrapper';
+import ConfettiCannon from 'react-native-confetti-cannon';
 import { useTheme } from '../lib/ThemeContext';
 import PremiumInput from '../components/PremiumInput';
-import {
-    addDoc,
-    collection,
-    setDoc,
-    doc,
-    updateDoc,
-    increment,
-    getDoc,
-    arrayUnion,
-} from 'firebase/firestore';
-import { db } from '../lib/firebaseConfig';
-import { useAuth } from '../lib/AuthContext';
+import { httpsCallable } from 'firebase/functions';
+import { functions } from '../lib/firebaseConfig';
 import { scheduleEventReminder } from '../lib/notificationService';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
 import { getEarlyBirdInfo } from '../lib/earlyBird';
+import { formatEventDate } from '../lib/formatEventDate';
 import PropTypes from 'prop-types';
 
 export default function EventRegistrationFormScreen({ navigation, route }) {
     const { event } = route.params;
-    const { user } = useAuth();
     const { theme } = useTheme();
     const styles = getStyles(theme);
 
     const [responses, setResponses] = useState({});
     const [loading, setLoading] = useState(false);
     const [datePickers, setDatePickers] = useState({});
+    const [showConfetti, setShowConfetti] = useState(false);
+    const { width: screenWidth } = Dimensions.get('window');
 
     useEffect(() => {
         const initial = {};
@@ -63,6 +59,8 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
     };
 
     const handleSubmit = async () => {
+        if (loading) return;
+
         if (!validate()) return;
 
         // 1. Paid Event Flow -> Navigate to Payment
@@ -79,60 +77,33 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
         // 2. Unpaid Event Flow -> Complete RSVP
         setLoading(true);
         try {
-            // A. Fetch User Data for Consistent RSVP Record
-            const userDoc = await getDoc(doc(db, 'users', user.uid));
-            const userData = userDoc.exists() ? userDoc.data() : {};
-
-            // B. Save Custom Form Responses
-            await addDoc(collection(db, 'registrations'), {
+            const registerForEvent = httpsCallable(functions, 'registerForEvent');
+            const result = await registerForEvent({
                 eventId: event.id,
-                eventId_userId: `${event.id}_${user.uid}`,
-                userId: user.uid,
-                userEmail: user.email,
-                userName: user.displayName,
                 responses: responses,
-                schemaAtSubmission: event.customFormSchema,
-                timestamp: new Date().toISOString(),
-                status: 'confirmed',
             });
 
-            // C. Add to Event Participants
-            await setDoc(doc(db, 'events', event.id, 'participants', user.uid), {
-                userId: user.uid,
-                name: user.displayName || 'Anonymous',
-                email: user.email,
-                branch: userData.branch || 'Unknown',
-                year: userData.year || 'Unknown',
-                joinedAt: new Date().toISOString(),
-            });
-
-            // D. Add to User's Participating List
-            await setDoc(doc(db, 'users', user.uid, 'participating', event.id), {
-                eventId: event.id,
-                joinedAt: new Date().toISOString(),
-            });
-
-            // E. Award Points & Early Bird Badge
-            const { isEligible: earlyBird } = getEarlyBirdInfo(event);
-            const userUpdate = { points: increment(10) };
-            if (earlyBird) {
-                userUpdate.badges = arrayUnion(`early_bird_${event.id}`);
-            }
-            await updateDoc(doc(db, 'users', user.uid), userUpdate);
+            const { earlyBird: finalEarlyBird } = result.data;
 
             // F. Schedule Reminder
             await scheduleEventReminder(event);
 
+            setShowConfetti(true);
             Alert.alert(
                 'Registered! 🎉',
-                earlyBird
+                finalEarlyBird
                     ? 'You earned +10 Points and the 🐦 Early Bird badge for being one of the first to sign up!'
                     : 'You earned +10 Points for registering.',
+                [
+                    {
+                        text: 'OK',
+                        onPress: () => navigation.popToTop(),
+                    },
+                ],
             );
-            navigation.popToTop();
         } catch (e) {
             console.error(e);
-            Alert.alert('Error', 'Failed to register.');
+            Alert.alert('Error', e.message || 'Failed to register.');
         } finally {
             setLoading(false);
         }
@@ -149,6 +120,7 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
                         value={responses[field.id] || ''}
                         onChangeText={t => handleChange(field.id, t)}
                         keyboardType={field.type === 'number' ? 'numeric' : 'default'}
+                        disabled={loading}
                     />
                 );
             case 'dropdown':
@@ -166,6 +138,10 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
                                         responses[field.id] === opt && styles.chipActive,
                                     ]}
                                     onPress={() => handleChange(field.id, opt)}
+                                    disabled={loading}
+                                    accessible={true}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={`${field.label} option ${opt}`}
                                 >
                                     <Text
                                         style={[
@@ -180,7 +156,7 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
                         </ScrollView>
                     </View>
                 );
-            case 'date':
+            case 'date': {
                 const currentDate = responses[field.id]
                     ? new Date(responses[field.id])
                     : new Date();
@@ -192,11 +168,15 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
                         <TouchableOpacity
                             style={styles.dateBtn}
                             onPress={() => setDatePickers({ ...datePickers, [field.id]: true })}
+                            disabled={loading}
+                            accessible={true}
+                            accessibilityRole="button"
+                            accessibilityLabel={`${field.label} date`}
                         >
                             <Ionicons name="calendar-outline" size={20} color={theme.colors.text} />
                             <Text style={styles.dateText}>
                                 {responses[field.id]
-                                    ? new Date(responses[field.id]).toLocaleDateString()
+                                    ? formatEventDate(responses[field.id])
                                     : 'Select Date'}
                             </Text>
                         </TouchableOpacity>
@@ -214,6 +194,7 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
                         )}
                     </View>
                 );
+            }
             default:
                 return null;
         }
@@ -221,40 +202,77 @@ export default function EventRegistrationFormScreen({ navigation, route }) {
 
     return (
         <ScreenWrapper>
+            {showConfetti && (
+                <View pointerEvents="none" style={styles.confettiOverlay}>
+                    <ConfettiCannon
+                        count={120}
+                        origin={{ x: screenWidth / 2, y: 0 }}
+                        fadeOut
+                        autoStart
+                        onAnimationEnd={() => setShowConfetti(false)}
+                    />
+                </View>
+            )}
             <View style={styles.header}>
-                <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+                <TouchableOpacity
+                    onPress={() => navigation.goBack()}
+                    style={styles.backBtn}
+                    accessible={true}
+                    accessibilityRole="button"
+                    accessibilityLabel="Back"
+                >
                     <Ionicons name="arrow-back" size={24} color={theme.colors.text} />
                 </TouchableOpacity>
                 <Text style={styles.headerTitle}>Registration</Text>
             </View>
 
-            <ScrollView contentContainerStyle={styles.content}>
-                <Text style={styles.eventTitle}>{event.title}</Text>
-                <Text style={styles.subtitle}>Please fill out the form below to register.</Text>
-
-                <View style={styles.form}>{event.customFormSchema.map(renderField)}</View>
-
-                <TouchableOpacity
-                    style={[styles.submitBtn, loading && { opacity: 0.7 }]}
-                    onPress={handleSubmit}
-                    disabled={loading}
+            <KeyboardAvoidingView
+                testID="registration-keyboard-avoiding-view"
+                style={styles.keyboardAvoidingView}
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                keyboardVerticalOffset={Platform.OS === 'ios' ? 16 : 0}
+            >
+                <ScrollView
+                    testID="registration-form-scroll-view"
+                    contentContainerStyle={styles.content}
+                    keyboardShouldPersistTaps="handled"
+                    keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+                    showsVerticalScrollIndicator={false}
                 >
-                    {loading ? (
-                        <ActivityIndicator color="#fff" />
-                    ) : (
-                        <Text style={styles.submitBtnText}>Submit Registration</Text>
-                    )}
-                </TouchableOpacity>
-            </ScrollView>
+                    <Text style={styles.eventTitle}>{event.title}</Text>
+                    <Text style={styles.subtitle}>Please fill out the form below to register.</Text>
+
+                    <View style={styles.form}>{event.customFormSchema.map(renderField)}</View>
+
+                    <TouchableOpacity
+                        style={[styles.submitBtn, loading && { opacity: 0.7 }]}
+                        onPress={handleSubmit}
+                        disabled={loading}
+                        accessible={true}
+                        accessibilityRole="button"
+                        accessibilityLabel="Submit Registration"
+                    >
+                        {loading ? (
+                            <View style={styles.submitLoadingContent}>
+                                <ActivityIndicator color="#fff" />
+                                <Text style={styles.submitBtnText}>Submitting...</Text>
+                            </View>
+                        ) : (
+                            <Text style={styles.submitBtnText}>Submit Registration</Text>
+                        )}
+                    </TouchableOpacity>
+                </ScrollView>
+            </KeyboardAvoidingView>
         </ScreenWrapper>
     );
 }
 
 const getStyles = theme =>
     StyleSheet.create({
+        keyboardAvoidingView: { flex: 1 },
         header: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 10 },
         headerTitle: { fontSize: 24, fontWeight: 'bold', color: theme.colors.text, marginLeft: 10 },
-        content: { padding: 20 },
+        content: { flexGrow: 1, padding: 20, paddingBottom: 40 },
         eventTitle: {
             fontSize: 22,
             fontWeight: 'bold',
@@ -309,6 +327,21 @@ const getStyles = theme =>
             elevation: 5,
         },
         submitBtnText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+        submitLoadingContent: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+        },
+        confettiOverlay: {
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 999,
+            elevation: 999,
+        },
     });
 
 EventRegistrationFormScreen.propTypes = {

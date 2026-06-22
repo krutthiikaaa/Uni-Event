@@ -158,4 +158,3 @@ exports.getTopContributors = functions.https.onCall(async (data) => {
             : null,
     };
 });
-//# sourceMappingURL=reputation.js.map

@@ -1,43 +1,62 @@
 import { Ionicons } from '@expo/vector-icons';
-import { collection, deleteDoc, doc, onSnapshot, query, where } from 'firebase/firestore';
-import { useEffect, useState } from 'react';
+import { FlashList } from '@shopify/flash-list';
+import {
+    collection,
+    doc,
+    onSnapshot,
+    query,
+    serverTimestamp,
+    updateDoc,
+    where,
+} from 'firebase/firestore';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
     ActivityIndicator,
     Alert,
-    FlatList,
     Platform,
-    RefreshControl,
     StyleSheet,
     Text,
     TouchableOpacity,
     View,
 } from 'react-native';
 import EventCard from '../components/EventCard';
+import LiquidPullToRefresh from '../components/LiquidPullToRefresh';
 import ScreenWrapper from '../components/ScreenWrapper';
+import usePullToRefresh from '../hooks/usePullToRefresh';
 import { useAuth } from '../lib/AuthContext';
 import { useTheme } from '../lib/ThemeContext';
 import { db } from '../lib/firebaseConfig';
+import { useIsFocused } from '@react-navigation/native';
 import PropTypes from 'prop-types';
 
 export default function MyEventsScreen({ navigation }) {
     const { user } = useAuth();
+    const userId = user?.uid;
     const { theme } = useTheme();
+    const isFocused = useIsFocused();
     const [events, setEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [refreshNonce, setRefreshNonce] = useState(0);
+    const [deletingEventId, setDeletingEventId] = useState(null);
+    const { pullDistance, handleScroll, handleScrollEndDrag } = usePullToRefresh(refreshing, () => {
+        setRefreshing(true);
+        setRefreshNonce(n => n + 1);
+    });
 
     useEffect(() => {
-        if (!user) return;
+        if (!userId || !isFocused) return;
 
-        const q = query(collection(db, 'events'), where('ownerId', '==', user.uid));
+        const q = query(collection(db, 'events'), where('ownerId', '==', userId));
 
         const unsubscribe = onSnapshot(
             q,
             snapshot => {
                 const list = [];
                 snapshot.forEach(doc => {
-                    list.push({ id: doc.id, ...doc.data() });
+                    const data = doc.data();
+                    if (data.deletedAt != null) return;
+                    list.push({ id: doc.id, ...data });
                 });
                 // Sort client-side by date
                 list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -53,91 +72,119 @@ export default function MyEventsScreen({ navigation }) {
         );
 
         return () => unsubscribe();
-    }, [user, refreshNonce]);
+    }, [userId, refreshNonce, isFocused]);
 
-    const handleDelete = async eventId => {
-        if (Platform.OS === 'web') {
-            try {
-                await deleteDoc(doc(db, 'events', eventId));
-            } catch (_e) {
-                console.error('Delete event failed (Web):', _e);
-                alert('Error: Could not delete event');
-            }
-        } else {
-            Alert.alert('Delete Event', 'Are you sure? This cannot be undone.', [
-                { text: 'Cancel', style: 'cancel' },
-                {
-                    text: 'Delete',
-                    style: 'destructive',
-                    onPress: async () => {
-                        try {
-                            await deleteDoc(doc(db, 'events', eventId));
-                        } catch (_e) {
-                            console.error('Delete event failed (Native):', _e);
-                            Alert.alert('Error', 'Could not delete event');
-                        }
+    const handleDelete = useCallback(
+        async eventId => {
+            if (deletingEventId === eventId) return;
+
+            const confirmMsg =
+                'Are you sure? The event will be soft-deleted and can be restored by an admin within 30 days. Attendees can no longer register.';
+            const deleteEvent = async () => {
+                setDeletingEventId(eventId);
+                try {
+                    await updateDoc(doc(db, 'events', eventId), {
+                        deletedAt: serverTimestamp(),
+                        deletedBy: userId,
+                        status: 'deleted',
+                    });
+                    Alert.alert('Deleted', 'Event deleted successfully.');
+                } catch (_e) {
+                    console.error('Delete event failed:', _e);
+                    Alert.alert('Error', 'Could not delete event');
+                } finally {
+                    setDeletingEventId(null);
+                }
+            };
+
+            if (Platform.OS === 'web') {
+                if (!globalThis.confirm(confirmMsg)) return;
+                await deleteEvent();
+            } else {
+                Alert.alert('Delete Event', confirmMsg, [
+                    { text: 'Cancel', style: 'cancel' },
+                    {
+                        text: 'Delete',
+                        style: 'destructive',
+                        onPress: deleteEvent,
                     },
-                },
-            ]);
-        }
-    };
+                ]);
+            }
+        },
+        [deletingEventId, userId],
+    );
 
-    const onRefresh = () => {
-        setRefreshing(true);
-        setRefreshNonce(n => n + 1);
-    };
+    // 🚀 Task 3: Wrap component renderer with useCallback to avoid functional rebuilds on updates
+    const renderItem = useCallback(
+        ({ item }) => (
+            <View style={styles.cardContainer}>
+                <EventCard event={item} showRegisterButton={false} style={{ marginBottom: 0 }} />
 
-    const renderItem = ({ item }) => (
-        <View style={styles.cardContainer}>
-            <EventCard event={item} showRegisterButton={false} style={{ marginBottom: 0 }} />
+                <View
+                    style={[
+                        styles.actionBar,
+                        { backgroundColor: theme.colors.surface, borderColor: theme.colors.border },
+                    ]}
+                >
+                    {/* Status */}
+                    <View style={styles.statusContainer}>
+                        <View
+                            style={[
+                                styles.dot,
+                                {
+                                    backgroundColor:
+                                        item.status === 'suspended'
+                                            ? theme.colors.error
+                                            : theme.colors.success,
+                                },
+                            ]}
+                        />
+                        <Text style={[styles.statusText, { color: theme.colors.text }]}>
+                            {item.status === 'suspended' ? 'SUSPENDED' : 'Active'}
+                        </Text>
+                    </View>
 
-            <View
-                style={[
-                    styles.actionBar,
-                    { backgroundColor: theme.colors.surface, borderColor: theme.colors.border },
-                ]}
-            >
-                {/* Status */}
-                <View style={styles.statusContainer}>
-                    <View
-                        style={[
-                            styles.dot,
-                            {
-                                backgroundColor:
-                                    item.status === 'suspended'
-                                        ? theme.colors.error
-                                        : theme.colors.success,
-                            },
-                        ]}
-                    />
-                    <Text style={[styles.statusText, { color: theme.colors.text }]}>
-                        {item.status === 'suspended' ? 'SUSPENDED' : 'Active'}
-                    </Text>
-                </View>
+                    {/* Actions */}
+                    <View style={styles.actions}>
+                        <TouchableOpacity
+                            style={[
+                                styles.actionBtn,
+                                { backgroundColor: theme.colors.primary + '15' },
+                            ]}
+                            onPress={() =>
+                                navigation.navigate('AttendanceDashboard', {
+                                    eventId: item.id,
+                                    eventTitle: item.title,
+                                })
+                            }
+                        >
+                            <Ionicons name="bar-chart" size={18} color={theme.colors.primary} />
+                        </TouchableOpacity>
 
-                {/* Actions */}
-                <View style={styles.actions}>
-                    <TouchableOpacity
-                        style={[styles.actionBtn, { backgroundColor: theme.colors.primary + '15' }]}
-                        onPress={() =>
-                            navigation.navigate('AttendanceDashboard', {
-                                eventId: item.id,
-                                eventTitle: item.title,
-                            })
-                        }
-                    >
-                        <Ionicons name="bar-chart" size={18} color={theme.colors.primary} />
-                    </TouchableOpacity>
-
-                    <TouchableOpacity
-                        style={[styles.actionBtn, { backgroundColor: theme.colors.error + '15' }]}
-                        onPress={() => handleDelete(item.id)}
-                    >
-                        <Ionicons name="trash-outline" size={18} color={theme.colors.error} />
-                    </TouchableOpacity>
+                        <TouchableOpacity
+                            style={[
+                                styles.actionBtn,
+                                { backgroundColor: theme.colors.error + '15' },
+                                deletingEventId === item.id && { opacity: 0.6 },
+                            ]}
+                            onPress={() => handleDelete(item.id)}
+                            disabled={deletingEventId === item.id}
+                        >
+                            {deletingEventId === item.id ? (
+                                <ActivityIndicator size="small" color={theme.colors.error} />
+                            ) : (
+                                <Ionicons
+                                    name="trash-outline"
+                                    size={18}
+                                    color={theme.colors.error}
+                                />
+                            )}
+                        </TouchableOpacity>
+                    </View>
                 </View>
             </View>
-        </View>
+        ),
+        [deletingEventId, handleDelete, theme, navigation],
     );
 
     if (loading)
@@ -167,18 +214,15 @@ export default function MyEventsScreen({ navigation }) {
                 </TouchableOpacity>
             </View>
 
-            <FlatList
+            {/* 🚀 Task 1: Replaced native FlatList with high-performance Shopify FlashList layout view */}
+            <FlashList
                 data={events}
                 keyExtractor={item => item.id}
                 contentContainerStyle={styles.list}
-                refreshControl={
-                    <RefreshControl
-                        refreshing={refreshing}
-                        onRefresh={onRefresh}
-                        colors={[theme.colors.primary]}
-                        tintColor={theme.colors.primary}
-                    />
-                }
+                estimatedItemSize={220} // 🔥 Critical allocation property ensures high performance recycling allocation
+                onScroll={handleScroll}
+                onScrollEndDrag={handleScrollEndDrag}
+                scrollEventThrottle={16}
                 ListEmptyComponent={
                     <View style={styles.emptyContainer}>
                         <Ionicons
@@ -201,6 +245,11 @@ export default function MyEventsScreen({ navigation }) {
                     </View>
                 }
                 renderItem={renderItem}
+            />
+            <LiquidPullToRefresh
+                pullDistance={pullDistance}
+                isRefreshing={refreshing}
+                color={theme.colors.primary}
             />
 
             {/* Floating Action Button */}
@@ -229,7 +278,7 @@ const styles = StyleSheet.create({
     },
     backBtn: { marginRight: 15 },
     title: { fontSize: 28, fontWeight: 'bold' },
-    list: { padding: 20, paddingBottom: 100 }, // Extra padding for FAB
+    list: { padding: 20, paddingBottom: 100 },
     cardContainer: { marginBottom: 20 },
     actionBar: {
         flexDirection: 'row',
@@ -240,9 +289,9 @@ const styles = StyleSheet.create({
         borderBottomRightRadius: 16,
         borderTopWidth: 0,
         borderWidth: 1,
-        marginTop: -10, // Overlap roughly with card bottom
+        marginTop: -10,
         zIndex: -1,
-        paddingTop: 15, // Compensate for overlap
+        paddingTop: 15,
     },
     statusContainer: { flexDirection: 'row', alignItems: 'center', gap: 6 },
     dot: { width: 8, height: 8, borderRadius: 4 },

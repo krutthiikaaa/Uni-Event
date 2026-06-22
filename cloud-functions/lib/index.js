@@ -36,7 +36,10 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.cleanupRateLimits = void 0;
 const admin = __importStar(require("firebase-admin"));
+const functions = __importStar(require("firebase-functions"));
+const rateLimiter_1 = require("./middleware/rateLimiter");
 admin.initializeApp();
 // Export functions here
 __exportStar(require("./dailyDigest"), exports);

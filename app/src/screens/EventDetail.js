@@ -14,11 +14,13 @@ import {
     updateDoc,
     where,
     arrayUnion,
+    runTransaction,
 } from 'firebase/firestore';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     ActivityIndicator,
     Alert,
+    Dimensions,
     ImageBackground,
     Linking,
     Platform,
@@ -27,21 +29,34 @@ import {
     Text,
     TouchableOpacity,
     View,
-    Share,
+    Switch,
 } from 'react-native';
+import ConfettiCannon from 'react-native-confetti-cannon';
 import FeedbackModal from '../components/FeedbackModal';
 import AppealModal from '../components/AppealModal';
+import HypeMeter from '../components/HypeMeter';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { useAuth } from '../lib/AuthContext';
 import * as CalendarService from '../lib/CalendarService';
 import { submitFeedback } from '../lib/feedbackService';
 import { db } from '../lib/firebaseConfig';
-import { cancelScheduledNotification, scheduleEventReminder } from '../lib/notificationService';
+import participantService from '../lib/participantService';
+import {
+    cancelScheduledNotification,
+    scheduleEventReminder,
+    triggerBuddyMatchNotification,
+} from '../lib/notificationService';
 import { useTheme } from '../lib/ThemeContext';
 import { sendBulkCertificates } from '../lib/EmailService';
 import { getEarlyBirdInfo, getTimestampMs } from '../lib/earlyBird';
+import { buildCounterUpdates, buildPreviewUpdate } from '../lib/eventAnalyticsCounters';
+import { formatEventDate, formatEventTime } from '../lib/formatEventDate';
+import { predictAttendance } from '../lib/capacityPredictor';
 import PropTypes from 'prop-types';
+import logger from '../lib/logger';
+import { BASE_URL } from '../lib/config';
+import { publicProfileRef } from '../lib/publicProfile';
 
 // Constants to eliminate SonarQube Magic Numbers
 const RSVP_POINTS_CHANGE = 10;
@@ -58,7 +73,15 @@ export default function EventDetail({ route, navigation }) {
 
     const [loading, setLoading] = useState(true);
     const [sendingCertificates, setSendingCertificates] = useState(false);
+    const sendingCertificatesRef = useRef(false);
+    const [bookmarkLoading, setBookmarkLoading] = useState(false);
+    const [reminderLoading, setReminderLoading] = useState(false);
+    const [buddyLoading, setBuddyLoading] = useState(false);
+    const [shareLoading, setShareLoading] = useState(false);
+    const [certificateDownloadLoading, setCertificateDownloadLoading] = useState(false);
+    const [linkedinLoading, setLinkedinLoading] = useState(false);
     const [rsvpStatus, setRsvpStatus] = useState(null);
+    const [rsvpLoading, setRsvpLoading] = useState(false);
     const [participantCount, setParticipantCount] = useState(0);
     const [waitlistStatus, setWaitlistStatus] = useState(null);
     const [waitlistPosition, setWaitlistPosition] = useState(null);
@@ -66,10 +89,13 @@ export default function EventDetail({ route, navigation }) {
     const [hasGivenFeedback, setHasGivenFeedback] = useState(false);
     const [showFeedbackModal, setShowFeedbackModal] = useState(false);
     const [showAppealModal, setShowAppealModal] = useState(false);
+    const [capacityPrediction, setCapacityPrediction] = useState(null);
 
     const [sendingAppeal, setSendingAppeal] = useState(false);
     const [activeTab, setActiveTab] = useState('about');
     const [expandedBenefits, setExpandedBenefits] = useState(new Set());
+    const [showConfetti, setShowConfetti] = useState(false);
+    const { width: screenWidth } = Dimensions.get('window');
 
     const toggleBenefits = idx => {
         setExpandedBenefits(prev => {
@@ -93,12 +119,42 @@ export default function EventDetail({ route, navigation }) {
             setShowAppealModal(false);
             Alert.alert('Submitted', 'Appeal sent to admin for review.');
         } catch (_e) {
-            console.error('Error submitting appeal:', _e);
+            logger.error('Error submitting appeal:', _e);
             Alert.alert('Error', 'Failed to submit appeal');
         } finally {
             setSendingAppeal(false);
         }
     };
+    const handleToggleBuddyDetail = async value => {
+        if (buddyLoading) return;
+        if (!user || !eventId) return;
+        try {
+            setBuddyLoading(true);
+            const participantRef = doc(db, 'events', eventId, 'participants', user.uid);
+            await updateDoc(participantRef, {
+                lookingForBuddy: value,
+            });
+
+            if (value) {
+                const otherBuddies = participants.filter(
+                    p => p.id !== user.uid && p.lookingForBuddy === true,
+                );
+                if (otherBuddies.length > 0) {
+                    await triggerBuddyMatchNotification(event, otherBuddies.length);
+                }
+            }
+            Alert.alert(
+                'Buddy Preference Updated',
+                value ? 'Buddy matching is now enabled.' : 'Buddy matching is now disabled.',
+            );
+        } catch (error) {
+            logger.error('Error toggling buddy preference:', error);
+            Alert.alert('Error', 'Failed to update buddy preference');
+        } finally {
+            setBuddyLoading(false);
+        }
+    };
+
     const [hostName, setHostName] = useState('Organizer');
     const [isVerifiedOrganizer, setIsVerifiedOrganizer] = useState(false);
     const [reminderId, setReminderId] = useState(null); // Firestore Doc ID if set
@@ -172,7 +228,7 @@ export default function EventDetail({ route, navigation }) {
                     });
                 }
             } catch (error) {
-                console.log('Error recording view:', error);
+                logger.debug('Error recording view:', error);
             }
         };
 
@@ -197,17 +253,18 @@ export default function EventDetail({ route, navigation }) {
             setLoading(false);
         });
 
-        const unsubParticipants = onSnapshot(
-            collection(db, `events/${eventId}/participants`),
-            snapshot => {
-                setParticipantCount(snapshot.size);
-                if (user) {
-                    const myDoc = snapshot.docs.find(d => d.id === user.uid);
-                    if (myDoc) setRsvpStatus('going');
-                    else setRsvpStatus(null);
-                }
-            },
-        );
+        const unsubParticipants = participantService.subscribeParticipants(db, eventId, data => {
+            const list = Array.isArray(data) ? data : [];
+            setParticipantCount(list.length);
+            setParticipants(list);
+            if (user) {
+                const myDoc = list.find(d => d.id === user.uid);
+                if (myDoc) setRsvpStatus('going');
+                else setRsvpStatus(null);
+            } else {
+                setRsvpStatus(null);
+            }
+        });
 
         const unsubWaitlist = onSnapshot(
             collection(db, `events/${eventId}/waitlist`),
@@ -263,27 +320,46 @@ export default function EventDetail({ route, navigation }) {
         };
     }, [eventId, user, navigation]);
 
+    useEffect(() => {
+        if (!event) return;
+        const cap = event.capacity;
+        if (!cap || cap <= 0) {
+            setCapacityPrediction(null);
+            return;
+        }
+        const rsvpCount = event.participantCount || 0;
+        predictAttendance({
+            category: event.category,
+            rsvpCount,
+            capacity: cap,
+        }).then(result => {
+            setCapacityPrediction(result);
+        });
+    }, [event]);
+
     // Derived State
     const isOwner = user && event?.ownerId === user.uid;
     const isSuspended = event?.status === 'suspended';
 
     const toggleBookmark = async () => {
+        if (bookmarkLoading) return;
         if (!user) {
             Alert.alert('Error', 'Please login to save events.');
             return;
         }
 
         try {
-            console.log('Toggling bookmark for event:', eventId, 'Current state:', isBookmarked);
+            setBookmarkLoading(true);
+            logger.debug('Toggling bookmark for event:', eventId, 'Current state:', isBookmarked);
             const bookmarkRef = doc(db, 'users', user.uid, 'savedEvents', eventId);
 
             if (isBookmarked) {
-                console.log('Removing bookmark...');
+                logger.debug('Removing bookmark...');
                 await deleteDoc(bookmarkRef);
                 setIsBookmarked(false);
                 Alert.alert('Removed', 'Event removed from saved events.');
             } else {
-                console.log('Adding bookmark...');
+                logger.debug('Adding bookmark...');
                 await setDoc(bookmarkRef, {
                     eventId: eventId,
                     savedAt: new Date().toISOString(),
@@ -291,17 +367,21 @@ export default function EventDetail({ route, navigation }) {
                 setIsBookmarked(true);
                 Alert.alert('Saved', 'Event saved for later!');
             }
-            console.log('Bookmark toggled successfully. New state:', !isBookmarked);
+            logger.debug('Bookmark toggled successfully. New state:', !isBookmarked);
         } catch (e) {
-            console.error('Bookmark error:', e);
+            logger.error('Bookmark error:', e);
             Alert.alert('Error', `Failed to save event: ${e.message}`);
+        } finally {
+            setBookmarkLoading(false);
         }
     };
 
     const shareEvent = async () => {
+        if (shareLoading) return;
         try {
-            const eventUrl = `https://unievent-ez2w.onrender.com/event/${eventId}`; // Replace with your actual domain
-            const shareMessage = `🎉 Check out this event: ${event.title}\n\n📅 ${new Date(event.startAt).toLocaleDateString()} at ${new Date(event.startAt).toLocaleTimeString()}\n📍 ${event.location || 'Online'}\n\n${eventUrl}`;
+            setShareLoading(true);
+            const eventUrl = `${BASE_URL}/event/${eventId}`;
+            const shareMessage = `🎉 Check out this event: ${event.title}\n\n📅 ${formatEventDate(event.startAt)} at ${formatEventTime(event.startAt)}\n📍 ${event.location || 'Online'}\n\n${eventUrl}`;
 
             // For web, use Web Share API if available
             if (Platform.OS === 'web' && navigator.share) {
@@ -346,14 +426,19 @@ export default function EventDetail({ route, navigation }) {
                 });
             }
         } catch (error) {
-            console.error('Error sharing:', error);
+            logger.error('Error sharing:', error);
+            Alert.alert('Error', 'Failed to share event.');
+        } finally {
+            setShareLoading(false);
         }
     };
 
     const toggleReminder = async () => {
+        if (reminderLoading) return;
         if (!user) return Alert.alert('Error', 'Please login to set reminders.');
 
         try {
+            setReminderLoading(true);
             if (reminderId) {
                 // Remove Reminder
                 const reminderDoc = await getDoc(doc(db, 'reminders', reminderId));
@@ -382,12 +467,16 @@ export default function EventDetail({ route, navigation }) {
                 }
             }
         } catch (e) {
-            console.error(e);
+            logger.error(e);
             Alert.alert('Error', 'Action failed.');
+        } finally {
+            setReminderLoading(false);
         }
     };
 
     const toggleRsvp = async () => {
+        if (rsvpLoading) return;
+
         if (!user) {
             Alert.alert('Sign In', 'Please sign in to register.');
             return;
@@ -422,16 +511,108 @@ export default function EventDetail({ route, navigation }) {
     };
 
     const performRsvp = async () => {
+        if (rsvpLoading) return;
+
         const ref = doc(db, 'events', eventId, 'participants', user.uid);
         const waitlistRef = doc(db, 'events', eventId, 'waitlist', user.uid);
         const userRef = doc(db, 'users', user.uid, 'participating', eventId);
         const userProfileRef = doc(db, 'users', user.uid);
+        const userPublicProfileRef = publicProfileRef(db, user.uid);
+        const eventRef = doc(db, 'events', eventId);
 
         try {
+            setRsvpLoading(true);
+            await runTransaction(db, async transaction => {
+                const participantDoc = await transaction.get(ref);
+                const userDoc = await transaction.get(userProfileRef);
+                const eventSnap = await transaction.get(eventRef);
+                const userData = userDoc.exists() ? userDoc.data() : {};
+                if (!eventSnap.exists()) {
+                    throw new Error('Event not found');
+                }
+
+                const eventData = eventSnap.data() || {};
+
+                if (participantDoc.exists()) {
+                    const participantData = participantDoc.data() || {};
+                    const nextPreview = buildPreviewUpdate({
+                        eventData,
+                        participant: {
+                            userId: user.uid,
+                            name: participantData.name || user.displayName || 'Anonymous',
+                            email: participantData.email || user.email,
+                            branch: participantData.branch || 'Unknown',
+                            year: participantData.year || 'Unknown',
+                        },
+                        delta: -1,
+                    });
+                    const eventUpdates = buildCounterUpdates({
+                        branch: participantData.branch || 'Unknown',
+                        year: participantData.year || 'Unknown',
+                        delta: -1,
+                        eventData,
+                    });
+                    eventUpdates.participantsPreview = nextPreview;
+
+                    // Withdraw RSVP
+                    transaction.delete(ref);
+                    transaction.delete(userRef);
+                    transaction.update(userProfileRef, { points: increment(-RSVP_POINTS_CHANGE) });
+                    transaction.set(
+                        userPublicProfileRef,
+                        { points: increment(-RSVP_POINTS_CHANGE) },
+                        { merge: true },
+                    );
+                    transaction.update(eventRef, eventUpdates);
+                } else {
+                    const participantPayload = {
+                        userId: user.uid,
+                        email: user.email,
+                        name: user.displayName || 'Anonymous',
+                        branch: userData.branch || 'Unknown',
+                        year: userData.year || 'Unknown',
+                        joinedAt: new Date().toISOString(),
+                    };
+
+                    // Add RSVP
+                    transaction.set(ref, participantPayload);
+                    transaction.set(userRef, {
+                        eventId: eventId,
+                        joinedAt: new Date().toISOString(),
+                    });
+
+                    const earlyBird = ebInfo?.isEligible;
+                    const userUpdate = { points: increment(RSVP_POINTS_CHANGE) };
+                    if (earlyBird) {
+                        userUpdate.badges = arrayUnion(`early_bird_${eventId}`);
+                    }
+                    transaction.update(userProfileRef, userUpdate);
+                    transaction.set(
+                        userPublicProfileRef,
+                        { points: increment(RSVP_POINTS_CHANGE) },
+                        { merge: true },
+                    );
+
+                    const nextPreview = buildPreviewUpdate({
+                        eventData,
+                        participant: participantPayload,
+                        delta: 1,
+                    });
+                    const eventUpdates = buildCounterUpdates({
+                        branch: participantPayload.branch,
+                        year: participantPayload.year,
+                        delta: 1,
+                        eventData,
+                    });
+                    eventUpdates.participantsPreview = nextPreview;
+                    transaction.update(eventRef, eventUpdates);
+                }
+            });
+
+            participantService.clearParticipantCache(eventId);
+
+            // Post-transaction effects
             if (rsvpStatus === 'going') {
-                await deleteDoc(ref);
-                await deleteDoc(userRef);
-                await updateDoc(userProfileRef, { points: increment(-RSVP_POINTS_CHANGE) });
                 Alert.alert(
                     'Withdrawn',
                     `You are no longer registered. (-${RSVP_POINTS_CHANGE} Points)`,
@@ -485,8 +666,10 @@ export default function EventDetail({ route, navigation }) {
                 }
             }
         } catch (e) {
-            console.error('RSVP Error: ', e);
+            logger.error('RSVP Error: ', e);
             Alert.alert('Error', 'Failed to update RSVP');
+        } finally {
+            setRsvpLoading(false);
         }
     };
 
@@ -508,41 +691,33 @@ export default function EventDetail({ route, navigation }) {
     const sendCertificates = async () => {
         setSendingCertificates(true);
         try {
-            // Fetch Participants
-            console.log(`Fetching participants for event: ${event.id}`);
-            const participantsRef = collection(db, `events/${event.id}/participants`);
-            const snapshot = await getDocs(participantsRef);
-            console.log(`Snapshot size: ${snapshot.size}`);
-
-            const participants = snapshot.docs
-                .map(doc => {
-                    const data = doc.data();
-                    console.log(`Participant: ${data.name}, Email: ${data.email}`);
-                    return {
-                        name: data.name,
-                        email: data.email,
-                    };
-                })
+            // Fetch Participants via participantService
+            logger.debug(`Fetching participants for event: ${event.id}`);
+            const snapshotData = await (
+                await import('../lib/participantService')
+            ).default.fetchParticipantsOnce(db, event.id);
+            const participants = (snapshotData || [])
+                .map(d => ({ name: d.name, email: d.email }))
                 .filter(p => p.email && p.email !== '-');
+            logger.debug(`Valid participants count: ${participants.length}`);
 
-            console.log(`Valid participants count: ${participants.length}`);
+            logger.debug(`Valid participants count: ${participants.length}`);
 
             if (participants.length === 0) {
                 Alert.alert('Error', 'No participants found with valid emails.');
-                setSendingCertificates(false);
                 return;
             }
 
             // Send certificates via EmailJS (Frontend)
-            console.log('Calling sendBulkCertificates...');
-            const eventLink = `https://unievent-ez2w.onrender.com/event/${event.id}`;
+            logger.debug('Calling sendBulkCertificates...');
+            const eventLink = `${BASE_URL}/event/${event.id}`;
             const count = await sendBulkCertificates(
                 participants,
                 event.title,
-                new Date(event.startAt).toLocaleDateString(),
+                formatEventDate(event.startAt),
                 eventLink,
             );
-            console.log(`Sent count: ${count}`);
+            logger.debug(`Sent count: ${count}`);
 
             // Update event status
             await updateDoc(doc(db, 'events', event.id), {
@@ -552,16 +727,15 @@ export default function EventDetail({ route, navigation }) {
 
             Alert.alert('Success', `Certificates sent to ${count} participants.`);
         } catch (e) {
-            console.error('Certificate Send Error:', e);
-            Alert.alert('Error', 'Failed to send certificates via EmailJS');
-        } finally {
-            setSendingCertificates(false);
+            logger.error('Certificate Send Error:', e);
+            Alert.alert('Error', e.message || 'Failed to send certificates');
         }
     };
 
     const handleDownloadCertificate = async () => {
+        if (certificateDownloadLoading) return;
         try {
-            setSendingCertificates(true);
+            setCertificateDownloadLoading(true);
 
             // Modern Professional Certificate Design
             const html = `
@@ -784,7 +958,7 @@ export default function EventDetail({ route, navigation }) {
                                 </div>
                                 
                                 <div class="sign-box">
-                                    <div class="sign-name">${new Date(event.startAt).toLocaleDateString()}</div>
+                                    <div class="sign-name">${formatEventDate(event.startAt)}</div>
                                     <div class="sign-label">Date Issued</div>
                                 </div>
                             </div>
@@ -805,10 +979,13 @@ export default function EventDetail({ route, navigation }) {
                     printWindow.document.close();
 
                     // Allow styles and fonts to load
-                    setTimeout(() => {
-                        printWindow.focus();
-                        printWindow.print();
-                    }, 500);
+                    await new Promise(resolve => {
+                        setTimeout(() => {
+                            printWindow.focus();
+                            printWindow.print();
+                            resolve();
+                        }, 500);
+                    });
                 } else {
                     Alert.alert('Blocked', 'Please allow pop-ups to download the certificate.');
                 }
@@ -831,14 +1008,16 @@ export default function EventDetail({ route, navigation }) {
                 }
             }
         } catch (e) {
-            console.error('Certificate Error:', e);
+            logger.error('Certificate Error:', e);
             Alert.alert('Error', 'Failed to generate certificate: ' + e.message);
         } finally {
-            setSendingCertificates(false); // Reset loading state
+            setCertificateDownloadLoading(false);
         }
     };
     const handleLinkedInShare = async () => {
+        if (linkedinLoading) return;
         try {
+            setLinkedinLoading(true);
             const linkedinUrl = `https://www.linkedin.com/profile/add?startTask=CERTIFICATION_NAME`;
 
             const certificateName = encodeURIComponent(event.title);
@@ -855,14 +1034,25 @@ export default function EventDetail({ route, navigation }) {
 
             await Linking.openURL(finalUrl);
         } catch (error) {
-            console.log(error);
+            logger.debug(error);
             Alert.alert('Error', 'Failed to open LinkedIn');
+        } finally {
+            setLinkedinLoading(false);
         }
     };
 
     const handleSendCertificates = async () => {
-        console.log('Send Certificates Button Clicked');
-        sendCertificates();
+        if (sendingCertificatesRef.current || sendingCertificates) return;
+
+        sendingCertificatesRef.current = true;
+        setSendingCertificates(true);
+        logger.debug('Send Certificates Button Clicked');
+        try {
+            await sendCertificates();
+        } finally {
+            sendingCertificatesRef.current = false;
+            setSendingCertificates(false);
+        }
     };
 
     const handleFeedbackSubmit = async data => {
@@ -880,8 +1070,8 @@ export default function EventDetail({ route, navigation }) {
             setHasGivenFeedback(true);
             Alert.alert('Thank You', 'Feedback submitted!');
         } catch (error) {
-            console.error(error);
-            Alert.alert('Error', 'Failed to submit feedback');
+            logger.error(error);
+            throw error;
         }
     };
 
@@ -944,8 +1134,7 @@ export default function EventDetail({ route, navigation }) {
         }
         const isExpired = deadline && new Date() > deadline;
         const isEarlyBirdTicket =
-            ticket.isEarlyBird || (ticket.name && ticket.name.toLowerCase().includes('early'));
-        const isFree = !ticket.price || ticket.price === 0;
+            ticket.isEarlyBird || ticket.name?.toLowerCase().includes('early');
         const accentColor = isEarlyBirdTicket ? '#EAB308' : theme.colors.primary;
         const benefitsOpen = expandedBenefits.has(idx);
         const hasBenefits = ticket.benefits && ticket.benefits.length > 0;
@@ -1134,7 +1323,7 @@ export default function EventDetail({ route, navigation }) {
                                                         fontWeight: '800',
                                                     }}
                                                 >
-                                                    {String.fromCharCode(10003)}
+                                                    {String.fromCodePoint(10003)}
                                                 </Text>
                                             </View>
                                             <Text
@@ -1215,10 +1404,12 @@ export default function EventDetail({ route, navigation }) {
                                 {isEarlyBirdTicket ? 'Early Bird Price' : 'Price'}
                             </Text>
                             <Text style={{ fontSize: 28, fontWeight: '800', color: accentColor }}>
-                                {isFree ? 'Free' : '\u20B9' + ticket.price}
+                                {!ticket.price || ticket.price === 0
+                                    ? 'Free'
+                                    : '\u20B9' + ticket.price}
                             </Text>
                         </View>
-                        {!isExpired && !isFree && (
+                        {!isExpired && ticket.price && ticket.price !== 0 && (
                             <View
                                 style={{
                                     backgroundColor: accentColor + '15',
@@ -1236,7 +1427,7 @@ export default function EventDetail({ route, navigation }) {
                                 </Text>
                             </View>
                         )}
-                        {!isExpired && isFree && (
+                        {!isExpired && (!ticket.price || ticket.price === 0) && (
                             <View
                                 style={{
                                     backgroundColor: '#22C55E15',
@@ -1258,8 +1449,48 @@ export default function EventDetail({ route, navigation }) {
         );
     };
 
+    let certificateButtonText = 'Send Certificates';
+    if (sendingCertificates) {
+        certificateButtonText = 'Sending...';
+    } else if (event?.certificatesSent) {
+        certificateButtonText = 'Certificates Sent';
+    }
+
+    const eventEnded = new Date(event.endAt) < new Date();
+    let primaryBtnOnPress = toggleRsvp;
+    if (eventEnded) {
+        primaryBtnOnPress =
+            rsvpStatus === 'going' && event.certificatesSent ? handleDownloadCertificate : null;
+    }
+
+    let primaryBtnText;
+    if (eventEnded) {
+        if (rsvpStatus === 'going') {
+            primaryBtnText = event.certificatesSent ? 'Download Certificate' : 'Event Ended';
+        } else {
+            primaryBtnText = 'Closed';
+        }
+    } else if (rsvpStatus === 'going') {
+        primaryBtnText = 'Registered \u2713';
+    } else if (event.isPaid) {
+        primaryBtnText = `Book Ticket (\u20B9${event.price})`;
+    } else {
+        primaryBtnText = 'RSVP Now';
+    }
+
     return (
         <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+            {showConfetti && (
+                <View pointerEvents="none" style={styles.confettiOverlay}>
+                    <ConfettiCannon
+                        count={120}
+                        origin={{ x: screenWidth / 2, y: 0 }}
+                        fadeOut
+                        autoStart
+                        onAnimationEnd={() => setShowConfetti(false)}
+                    />
+                </View>
+            )}
             <ScrollView bounces={false} showsVerticalScrollIndicator={false}>
                 {/* Immersive Header Image */}
                 <ImageBackground
@@ -1289,14 +1520,22 @@ export default function EventDetail({ route, navigation }) {
                             </TouchableOpacity>
 
                             <TouchableOpacity
-                                style={styles.bookmarkButton}
+                                style={[
+                                    styles.bookmarkButton,
+                                    bookmarkLoading && styles.disabledButton,
+                                ]}
                                 onPress={toggleBookmark}
+                                disabled={bookmarkLoading}
                             >
-                                <Ionicons
-                                    name={isBookmarked ? 'bookmark' : 'bookmark-outline'}
-                                    size={24}
-                                    color="#fff"
-                                />
+                                {bookmarkLoading ? (
+                                    <ActivityIndicator size="small" color="#fff" />
+                                ) : (
+                                    <Ionicons
+                                        name={isBookmarked ? 'bookmark' : 'bookmark-outline'}
+                                        size={24}
+                                        color="#fff"
+                                    />
+                                )}
                             </TouchableOpacity>
                         </View>
 
@@ -1386,14 +1625,13 @@ export default function EventDetail({ route, navigation }) {
                                 <View style={[styles.priceBadge, { backgroundColor: '#F59E0B' }]}>
                                     <Ionicons name="cash" size={14} color="#fff" />
                                     <Text style={styles.priceText}>
-                                        ₹{getEarlyBirdInfo(event).currentPrice}
-                                        {getEarlyBirdInfo(event).isEligible &&
-                                            getEarlyBirdInfo(event).isExplicit && (
-                                                <Text style={{ fontSize: 10, opacity: 0.8 }}>
-                                                    {' '}
-                                                    (Early Bird)
-                                                </Text>
-                                            )}
+                                        ₹{ebInfo?.currentPrice ?? event.price}
+                                        {ebInfo?.isEligible && ebInfo?.isExplicit && (
+                                            <Text style={{ fontSize: 10, opacity: 0.8 }}>
+                                                {' '}
+                                                (Early Bird)
+                                            </Text>
+                                        )}
                                     </Text>
                                 </View>
                             ) : (
@@ -1403,7 +1641,7 @@ export default function EventDetail({ route, navigation }) {
                                 </View>
                             )}
                             {/* Early Bird indicator */}
-                            {getEarlyBirdInfo(event).isEligible && rsvpStatus !== 'going' && (
+                            {ebInfo?.isEligible && rsvpStatus !== 'going' && (
                                 <View style={[styles.priceBadge, { backgroundColor: '#EAB308' }]}>
                                     <Text style={styles.priceText}>🐦 Early Bird</Text>
                                 </View>
@@ -1471,7 +1709,11 @@ export default function EventDetail({ route, navigation }) {
                     <View
                         style={[styles.quickActionsCard, { backgroundColor: theme.colors.surface }]}
                     >
-                        <TouchableOpacity style={styles.quickAction} onPress={toggleReminder}>
+                        <TouchableOpacity
+                            style={[styles.quickAction, reminderLoading && styles.disabledButton]}
+                            onPress={toggleReminder}
+                            disabled={reminderLoading}
+                        >
                             <View
                                 style={[
                                     styles.quickActionIcon,
@@ -1482,14 +1724,23 @@ export default function EventDetail({ route, navigation }) {
                                     },
                                 ]}
                             >
-                                <Ionicons
-                                    name={reminderId ? 'notifications' : 'notifications-outline'}
-                                    size={20}
-                                    color={reminderId ? '#fff' : theme.colors.primary}
-                                />
+                                {reminderLoading ? (
+                                    <ActivityIndicator
+                                        size="small"
+                                        color={reminderId ? '#fff' : theme.colors.primary}
+                                    />
+                                ) : (
+                                    <Ionicons
+                                        name={
+                                            reminderId ? 'notifications' : 'notifications-outline'
+                                        }
+                                        size={20}
+                                        color={reminderId ? '#fff' : theme.colors.primary}
+                                    />
+                                )}
                             </View>
                             <Text style={[styles.quickActionLabel, { color: theme.colors.text }]}>
-                                Remind
+                                {reminderLoading ? 'Saving...' : 'Remind'}
                             </Text>
                         </TouchableOpacity>
 
@@ -1511,21 +1762,29 @@ export default function EventDetail({ route, navigation }) {
                             </Text>
                         </TouchableOpacity>
 
-                        <TouchableOpacity style={styles.quickAction} onPress={shareEvent}>
+                        <TouchableOpacity
+                            style={[styles.quickAction, shareLoading && styles.disabledButton]}
+                            onPress={shareEvent}
+                            disabled={shareLoading}
+                        >
                             <View
                                 style={[
                                     styles.quickActionIcon,
                                     { backgroundColor: theme.colors.primary + '20' },
                                 ]}
                             >
-                                <Ionicons
-                                    name="share-social-outline"
-                                    size={20}
-                                    color={theme.colors.primary}
-                                />
+                                {shareLoading ? (
+                                    <ActivityIndicator size="small" color={theme.colors.primary} />
+                                ) : (
+                                    <Ionicons
+                                        name="share-social-outline"
+                                        size={20}
+                                        color={theme.colors.primary}
+                                    />
+                                )}
                             </View>
                             <Text style={[styles.quickActionLabel, { color: theme.colors.text }]}>
-                                Share
+                                {shareLoading ? 'Sharing...' : 'Share'}
                             </Text>
                         </TouchableOpacity>
 
@@ -1555,6 +1814,210 @@ export default function EventDetail({ route, navigation }) {
                             </Text>
                         </TouchableOpacity>
                     </View>
+                    {rsvpStatus === 'going' && !isOwner && !isSuspended && (
+                        <View
+                            style={[
+                                styles.buddyCard,
+                                { backgroundColor: theme.colors.surface, ...theme.shadows.small },
+                            ]}
+                        >
+                            <View style={styles.buddyHeader}>
+                                <View style={styles.buddyHeaderTitleRow}>
+                                    <Ionicons
+                                        name="people"
+                                        size={24}
+                                        color={theme.colors.primary}
+                                    />
+                                    <Text
+                                        style={[
+                                            styles.buddyCardTitle,
+                                            { color: theme.colors.text },
+                                        ]}
+                                    >
+                                        Buddy Matching
+                                    </Text>
+                                </View>
+                                <Switch
+                                    value={
+                                        participants.find(p => p.id === user?.uid)
+                                            ?.lookingForBuddy || false
+                                    }
+                                    onValueChange={handleToggleBuddyDetail}
+                                    disabled={buddyLoading}
+                                    trackColor={{
+                                        false: theme.colors.border,
+                                        true: theme.colors.primary + '80',
+                                    }}
+                                    thumbColor={
+                                        participants.find(p => p.id === user?.uid)?.lookingForBuddy
+                                            ? theme.colors.primary
+                                            : '#999'
+                                    }
+                                />
+                            </View>
+
+                            {participants.find(p => p.id === user?.uid)?.lookingForBuddy ? (
+                                <View style={styles.buddyContent}>
+                                    {participants.some(
+                                        p => p.id !== user?.uid && p.lookingForBuddy === true,
+                                    ) ? (
+                                        <View>
+                                            <Text
+                                                style={[
+                                                    styles.buddyMatchHeading,
+                                                    { color: theme.colors.success },
+                                                ]}
+                                            >
+                                                Buddy Matches Found!
+                                            </Text>
+                                            <Text
+                                                style={[
+                                                    styles.buddyMeetupSpot,
+                                                    { color: theme.colors.text },
+                                                ]}
+                                            >
+                                                {event.eventMode === 'online'
+                                                    ? 'Meetup Spot: We suggest connecting in the event chat room!'
+                                                    : `Meetup Spot: Near the Main Entrance Lobby / Registration Desk of ${event.location || 'the venue'}. Look for the 'Buddy Meetup' sign!`}
+                                            </Text>
+                                            <Text
+                                                style={[
+                                                    styles.buddyListLabel,
+                                                    { color: theme.colors.textSecondary },
+                                                ]}
+                                            >
+                                                Other students looking for buddies:
+                                            </Text>
+                                            <View style={styles.buddyList}>
+                                                {participants
+                                                    .filter(
+                                                        p =>
+                                                            p.id !== user?.uid &&
+                                                            p.lookingForBuddy === true,
+                                                    )
+                                                    .map(buddy => (
+                                                        <View
+                                                            key={buddy.id}
+                                                            style={[
+                                                                styles.buddyItem,
+                                                                {
+                                                                    borderColor:
+                                                                        theme.colors.border,
+                                                                },
+                                                            ]}
+                                                        >
+                                                            <View
+                                                                style={[
+                                                                    styles.buddyAvatar,
+                                                                    {
+                                                                        backgroundColor:
+                                                                            theme.colors.primary +
+                                                                            '20',
+                                                                    },
+                                                                ]}
+                                                            >
+                                                                <Text
+                                                                    style={[
+                                                                        styles.buddyAvatarText,
+                                                                        {
+                                                                            color: theme.colors
+                                                                                .primary,
+                                                                        },
+                                                                    ]}
+                                                                >
+                                                                    {buddy.name?.[0]?.toUpperCase() ||
+                                                                        'B'}
+                                                                </Text>
+                                                            </View>
+                                                            <View style={styles.buddyInfo}>
+                                                                <Text
+                                                                    style={[
+                                                                        styles.buddyName,
+                                                                        {
+                                                                            color: theme.colors
+                                                                                .text,
+                                                                        },
+                                                                    ]}
+                                                                >
+                                                                    {buddy.name || 'Anonymous'}
+                                                                </Text>
+                                                                <Text
+                                                                    style={[
+                                                                        styles.buddyDetails,
+                                                                        {
+                                                                            color: theme.colors
+                                                                                .textSecondary,
+                                                                        },
+                                                                    ]}
+                                                                >
+                                                                    {buddy.branch ||
+                                                                        'Unknown Branch'}{' '}
+                                                                    • Year {buddy.year || 'Unknown'}
+                                                                </Text>
+                                                            </View>
+                                                        </View>
+                                                    ))}
+                                            </View>
+                                            <TouchableOpacity
+                                                style={[
+                                                    styles.buddyChatBtn,
+                                                    { backgroundColor: theme.colors.primary },
+                                                ]}
+                                                onPress={() =>
+                                                    navigation.navigate('EventChat', {
+                                                        eventId: event.id,
+                                                        title: event.title,
+                                                    })
+                                                }
+                                            >
+                                                <Ionicons
+                                                    name="chatbubbles"
+                                                    size={18}
+                                                    color="#fff"
+                                                />
+                                                <Text style={styles.buddyChatBtnText}>
+                                                    Say Hello in Event Chat
+                                                </Text>
+                                            </TouchableOpacity>
+                                        </View>
+                                    ) : (
+                                        <View style={styles.buddyWaiting}>
+                                            <Text
+                                                style={[
+                                                    styles.buddyStatusHeading,
+                                                    { color: theme.colors.primary },
+                                                ]}
+                                            >
+                                                Looking for a Buddy... 🔍
+                                            </Text>
+                                            <Text
+                                                style={[
+                                                    styles.buddyWaitingText,
+                                                    { color: theme.colors.textSecondary },
+                                                ]}
+                                            >
+                                                We&apos;ll notify you as soon as someone else
+                                                toggles this! In the meantime, the designated Meetup
+                                                Spot is near the Main Lobby.
+                                            </Text>
+                                        </View>
+                                    )}
+                                </View>
+                            ) : (
+                                <View style={styles.buddyPromo}>
+                                    <Text
+                                        style={[
+                                            styles.buddyPromoText,
+                                            { color: theme.colors.textSecondary },
+                                        ]}
+                                    >
+                                        Going alone? Toggle buddy matching to find other students to
+                                        meet before the event!
+                                    </Text>
+                                </View>
+                            )}
+                        </View>
+                    )}
 
                     {/* Event Details Card */}
                     <View style={[styles.detailsCard, { backgroundColor: theme.colors.surface }]}>
@@ -1577,12 +2040,7 @@ export default function EventDetail({ route, navigation }) {
                                     Date & Time
                                 </Text>
                                 <Text style={[styles.detailValue, { color: theme.colors.text }]}>
-                                    {new Date(event.startAt).toLocaleDateString('en-US', {
-                                        weekday: 'short',
-                                        month: 'short',
-                                        day: 'numeric',
-                                        year: 'numeric',
-                                    })}
+                                    {formatEventDate(event.startAt)}
                                 </Text>
                                 <Text
                                     style={[
@@ -1590,10 +2048,7 @@ export default function EventDetail({ route, navigation }) {
                                         { color: theme.colors.textSecondary },
                                     ]}
                                 >
-                                    {new Date(event.startAt).toLocaleTimeString([], {
-                                        hour: '2-digit',
-                                        minute: '2-digit',
-                                    })}
+                                    {formatEventTime(event.startAt)}
                                 </Text>
                             </View>
                         </View>
@@ -1625,6 +2080,77 @@ export default function EventDetail({ route, navigation }) {
                                 </Text>
                             </View>
                         </View>
+
+                        {event.capacity && (
+                            <>
+                                <View
+                                    style={[
+                                        styles.detailDivider,
+                                        { backgroundColor: theme.colors.border },
+                                    ]}
+                                />
+                                <View style={styles.detailRow}>
+                                    <View
+                                        style={[
+                                            styles.detailIconContainer,
+                                            { backgroundColor: theme.colors.primary + '15' },
+                                        ]}
+                                    >
+                                        <Ionicons
+                                            name="people-outline"
+                                            size={22}
+                                            color={theme.colors.primary}
+                                        />
+                                    </View>
+                                    <View style={styles.detailContent}>
+                                        <Text
+                                            style={[
+                                                styles.detailLabel,
+                                                { color: theme.colors.textSecondary },
+                                            ]}
+                                        >
+                                            Capacity
+                                        </Text>
+                                        <Text
+                                            style={[
+                                                styles.detailValue,
+                                                { color: theme.colors.text },
+                                            ]}
+                                        >
+                                            {event.participantCount || 0} / {event.capacity}
+                                        </Text>
+                                        <HypeMeter
+                                            current={participantCount || 0}
+                                            capacity={event.capacity}
+                                        />
+                                        {capacityPrediction?.severity === 'high' && (
+                                            <Text
+                                                style={{
+                                                    color: '#dc2626',
+                                                    fontSize: 12,
+                                                    marginTop: 2,
+                                                    fontWeight: '500',
+                                                }}
+                                            >
+                                                ⚠ Likely to exceed capacity
+                                            </Text>
+                                        )}
+                                        {capacityPrediction?.severity === 'medium' && (
+                                            <Text
+                                                style={{
+                                                    color: '#a16207',
+                                                    fontSize: 12,
+                                                    marginTop: 2,
+                                                    fontWeight: '500',
+                                                }}
+                                            >
+                                                ⚡ Approaching capacity
+                                            </Text>
+                                        )}
+                                    </View>
+                                </View>
+                            </>
+                        )}
                     </View>
 
                     {/* Tabs Navigation — Interactive */}
@@ -1834,6 +2360,7 @@ export default function EventDetail({ route, navigation }) {
                                                 backgroundColor: theme.colors.success + '10',
                                                 borderColor: theme.colors.success,
                                             },
+                                            sendingCertificates && styles.disabledButton,
                                         ]}
                                         onPress={
                                             event.certificatesSent
@@ -1880,11 +2407,7 @@ export default function EventDetail({ route, navigation }) {
                                                 },
                                             ]}
                                         >
-                                            {sendingCertificates
-                                                ? 'Sending...'
-                                                : event.certificatesSent
-                                                  ? 'Certificates Sent'
-                                                  : 'Send Certificates'}
+                                            {certificateButtonText}
                                         </Text>
                                     </TouchableOpacity>
                                 )}
@@ -1959,16 +2482,12 @@ export default function EventDetail({ route, navigation }) {
                                     borderColor: theme.colors.textSecondary,
                                 },
                         ]}
-                        onPress={
-                            new Date(event.endAt) < new Date()
-                                ? rsvpStatus === 'going' && event.certificatesSent
-                                    ? handleDownloadCertificate
-                                    : null
-                                : toggleRsvp
-                        }
+                        onPress={primaryBtnOnPress}
                         disabled={
-                            new Date(event.endAt) < new Date() &&
-                            !(rsvpStatus === 'going' && event.certificatesSent)
+                            rsvpLoading ||
+                            certificateDownloadLoading ||
+                            (new Date(event.endAt) < new Date() &&
+                                !(rsvpStatus === 'going' && event.certificatesSent))
                         }
                     >
                         <Text
@@ -2021,7 +2540,7 @@ export default function EventDetail({ route, navigation }) {
     );
 }
 
-const getStyles = theme =>
+export const getStyles = theme =>
     StyleSheet.create({
         // Header
         headerImage: { height: 350, width: '100%' },
@@ -2067,6 +2586,15 @@ const getStyles = theme =>
             backgroundColor: theme.colors.background,
             paddingHorizontal: 24,
             paddingTop: 32,
+        },
+        confettiOverlay: {
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 999,
+            elevation: 999,
         },
 
         // Header Section
@@ -2359,6 +2887,15 @@ const getStyles = theme =>
             borderWidth: 2,
             borderColor: theme.colors.primary,
         },
+        disabledButton: {
+            opacity: 0.7,
+        },
+        rsvpLoadingContent: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+        },
         primaryBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
         secondaryBtnText: { color: theme.colors.primary },
 
@@ -2413,6 +2950,113 @@ const getStyles = theme =>
         passPrice: {
             fontSize: 28,
             fontWeight: '800',
+        },
+        buddyCard: {
+            padding: 20,
+            borderRadius: 20,
+            marginBottom: 20,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+        },
+        buddyHeader: {
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 10,
+        },
+        buddyHeaderTitleRow: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 10,
+        },
+        buddyCardTitle: {
+            fontSize: 18,
+            fontWeight: '700',
+        },
+        buddyContent: {
+            marginTop: 10,
+        },
+        buddyMatchHeading: {
+            fontSize: 16,
+            fontWeight: '700',
+            marginBottom: 8,
+        },
+        buddyMeetupSpot: {
+            fontSize: 14,
+            fontWeight: '600',
+            lineHeight: 20,
+            marginBottom: 12,
+        },
+        buddyListLabel: {
+            fontSize: 13,
+            fontWeight: '600',
+            marginBottom: 8,
+        },
+        buddyList: {
+            gap: 10,
+            marginBottom: 16,
+        },
+        buddyItem: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 12,
+            padding: 10,
+            borderRadius: 12,
+            borderWidth: 1,
+        },
+        buddyAvatar: {
+            width: 36,
+            height: 36,
+            borderRadius: 18,
+            alignItems: 'center',
+            justifyContent: 'center',
+        },
+        buddyAvatarText: {
+            fontSize: 16,
+            fontWeight: '700',
+        },
+        buddyInfo: {
+            flex: 1,
+        },
+        buddyName: {
+            fontSize: 14,
+            fontWeight: '600',
+        },
+        buddyDetails: {
+            fontSize: 12,
+        },
+        buddyChatBtn: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+            paddingVertical: 12,
+            borderRadius: 12,
+            marginTop: 4,
+        },
+        buddyChatBtnText: {
+            color: '#fff',
+            fontWeight: '700',
+            fontSize: 14,
+        },
+        buddyWaiting: {
+            paddingVertical: 10,
+        },
+        buddyStatusHeading: {
+            fontSize: 15,
+            fontWeight: '700',
+            marginBottom: 6,
+        },
+        buddyWaitingText: {
+            fontSize: 13,
+            lineHeight: 18,
+        },
+        buddyPromo: {
+            paddingTop: 4,
+        },
+        buddyPromoText: {
+            fontSize: 13,
+            lineHeight: 18,
         },
     });
 

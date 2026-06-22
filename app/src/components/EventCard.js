@@ -1,305 +1,499 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
-import { doc, getDoc } from 'firebase/firestore';
-import { useEffect, useState } from 'react';
-import { Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+    doc,
+    getDoc,
+    updateDoc,
+    onSnapshot,
+    collection,
+    query,
+    where,
+    getDocs,
+} from 'firebase/firestore';
+import React, { useEffect, useRef, useState, memo } from 'react';
+import {
+    ActivityIndicator,
+    Alert,
+    Image,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View,
+    Switch,
+    Platform,
+} from 'react-native';
 import { db } from '../lib/firebaseConfig';
-import { theme } from '../lib/theme';
+import { theme as globalTheme } from '../lib/theme';
 import { useTheme } from '../lib/ThemeContext';
 import { getEarlyBirdInfo } from '../lib/earlyBird';
 import { ShimmerItem } from './SkeletonLoader';
+import { useAuth } from '../lib/AuthContext';
+import { triggerBuddyMatchNotification } from '../lib/notificationService';
+import { formatEventDate, formatEventTime } from '../lib/formatEventDate';
 import PropTypes from 'prop-types';
 
-export default function EventCard({
-    event,
-    onLike,
-    onShare,
-    isLiked = false,
-    isRegistered = false,
-    isRecommended = false,
-    showRegisterButton = true,
-    style,
-}) {
-    const navigation = useNavigation();
-    const { theme } = useTheme();
-    const [hostName, setHostName] = useState(event?.organization || 'Club Name');
-    const [bannerLoaded, setBannerLoaded] = useState(false);
-    const [flyerLoaded, setFlyerLoaded] = useState(false);
+const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+const profileCache = new Map();
+const profileRequestCache = new Map();
 
-    useEffect(() => {
-        setBannerLoaded(false);
-    }, [event?.bannerUrl]);
+const formatMetric = (value, singular, plural) => {
+    const count = value ?? 0;
+    return `${count} ${count === 1 ? singular : plural}`;
+};
 
-    useEffect(() => {
-        setFlyerLoaded(false);
-    }, [event?.detailImageUrl, event?.bannerUrl]);
+// Custom comparison: only re-render if relevant props change
+function arePropsEqual(prevProps, nextProps) {
+    return (
+        prevProps.event?.id === nextProps.event?.id &&
+        prevProps.event?.title === nextProps.event?.title &&
+        prevProps.event?.location === nextProps.event?.location &&
+        prevProps.event?.startAt === nextProps.event?.startAt &&
+        prevProps.event?.isPaid === nextProps.event?.isPaid &&
+        prevProps.event?.status === nextProps.event?.status &&
+        prevProps.isRegistered === nextProps.isRegistered &&
+        prevProps.isLiked === nextProps.isLiked &&
+        prevProps.isRecommended === nextProps.isRecommended &&
+        prevProps.showRegisterButton === nextProps.showRegisterButton &&
+        prevProps.style === nextProps.style
+    );
+}
 
-    useEffect(() => {
-        if (event?.ownerId) {
-            getDoc(doc(db, 'users', event.ownerId)).then(snap => {
-                if (snap.exists()) {
-                    setHostName(snap.data().displayName || event.organization || 'Club Name');
+const EventCard = memo(
+    ({
+        event,
+        onLike,
+        onShare,
+        isLiked = false,
+        isRegistered = false,
+        isRecommended = false,
+        showRegisterButton = true,
+        style,
+    }) => {
+        const navigation = useNavigation();
+        const { theme } = useTheme();
+        const { user } = useAuth();
+        const [hostName, setHostName] = useState(event?.organization || 'Club Name');
+        const [bannerLoaded, setBannerLoaded] = useState(false);
+        const [flyerLoaded, setFlyerLoaded] = useState(false);
+        const [lookingForBuddy, setLookingForBuddy] = useState(false);
+        const [isNavigatingToDetail, setIsNavigatingToDetail] = useState(false);
+        const navigationLockRef = useRef(false);
+        const navigationUnlockTimerRef = useRef(null);
+        const [buddyLoading, setBuddyLoading] = useState(false);
+
+        useEffect(() => {
+            if (!isRegistered || !user || !event?.id) return;
+
+            const participantRef = doc(db, 'events', event.id, 'participants', user.uid);
+            const unsubscribe = onSnapshot(participantRef, docSnap => {
+                if (docSnap.exists()) {
+                    setLookingForBuddy(docSnap.data().lookingForBuddy || false);
                 }
             });
-        }
-    }, [event?.ownerId, event?.organization]);
 
-    if (!event) return null;
+            return () => unsubscribe();
+        }, [isRegistered, user, event?.id]);
 
-    const dateObj = new Date(event.startAt);
+        const handleToggleBuddy = async value => {
+            if (buddyLoading) return;
+            if (!user || !event?.id) return;
+            try {
+                setBuddyLoading(true);
+                const participantRef = doc(db, 'events', event.id, 'participants', user.uid);
+                await updateDoc(participantRef, {
+                    lookingForBuddy: value,
+                });
 
-    // Format Date: "OCT 15"
-    const month = dateObj.toLocaleString('default', { month: 'short' }).toUpperCase();
-    const day = dateObj.getDate();
+                if (value) {
+                    const participantsRef = collection(db, 'events', event.id, 'participants');
+                    const q = query(participantsRef, where('lookingForBuddy', '==', true));
+                    const snapshot = await getDocs(q);
+                    const otherBuddies = snapshot.docs.filter(d => d.id !== user.uid);
+                    if (otherBuddies.length > 0) {
+                        await triggerBuddyMatchNotification(event, otherBuddies.length);
+                    }
+                }
+                Alert.alert(
+                    'Buddy Preference Updated',
+                    value ? 'Buddy matching is now enabled.' : 'Buddy matching is now disabled.',
+                );
+            } catch (error) {
+                console.error('Error updating buddy preference:', error);
+                Alert.alert('Error', 'Failed to update buddy preference.');
+            } finally {
+                setBuddyLoading(false);
+            }
+        };
 
-    // Format Time: "7 PM"
-    const time = dateObj.toLocaleString('default', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-    });
+        useEffect(() => {
+            setBannerLoaded(false);
+        }, [event?.bannerUrl]);
 
-    // Fallback for second image if not present in data
-    const flyerUrl =
-        event.detailImageUrl ||
-        event.bannerUrl ||
-        'https://dummyimage.com/400x400/cccccc/000000.png&text=No+Image';
+        useEffect(() => {
+            setFlyerLoaded(false);
+        }, [event?.detailImageUrl, event?.bannerUrl]);
 
-    const { isEligible: isEarlyBird, currentPrice } = getEarlyBirdInfo(event);
+        useEffect(() => {
+            if (!event?.ownerId) return;
 
-    return (
-        <TouchableOpacity
-            style={[
-                styles.card,
-                { backgroundColor: theme.colors.surface, ...theme.shadows.default },
-                style,
-            ]}
-            activeOpacity={0.9}
-            onPress={() => navigation.navigate('EventDetail', { eventId: event.id })}
-        >
-            {/* 1. MAIN BANNER IMAGE (Top Layer) */}
-            <View style={[styles.bannerContainer, isRecommended && { height: 140 }]}>
-                {!bannerLoaded && (
-                    <ShimmerItem
-                        style={[
-                            styles.bannerImage,
-                            isRecommended && { height: 140 },
-                            StyleSheet.absoluteFill,
-                        ]}
-                    />
-                )}
-                <Image
-                    source={{
-                        uri:
-                            event.bannerUrl ||
-                            'https://dummyimage.com/800x400/cccccc/000000.png&text=No+Image',
-                    }}
-                    style={[styles.bannerImage, isRecommended && { height: 140 }]} // Compact height for recommended
-                    resizeMode="cover"
-                    onLoadEnd={() => setBannerLoaded(true)}
-                />
-                <LinearGradient
-                    colors={['transparent', 'rgba(0,0,0,0.4)']}
-                    style={StyleSheet.absoluteFillObject}
-                />
-                {/* Category Tag on Banner */}
-                <View style={[styles.categoryBadge, { backgroundColor: theme.colors.surface }]}>
-                    <Text style={[styles.categoryText, { color: theme.colors.text }]}>
-                        {event.category}
-                    </Text>
-                </View>
+            setHostName(event?.organization || 'Club Name');
 
-                {/* Live / Online Badge */}
-                {new Date() >= new Date(event.startAt) && new Date() <= new Date(event.endAt) ? (
+            const cachedProfile = profileCache.get(event.ownerId);
+            if (cachedProfile && Date.now() - cachedProfile.cachedAt < PROFILE_CACHE_TTL_MS) {
+                setHostName(cachedProfile.data.displayName || event.organization || 'Club Name');
+                return;
+            }
+
+            if (cachedProfile) {
+                profileCache.delete(event.ownerId);
+            }
+
+            let cancelled = false;
+
+            if (!profileRequestCache.has(event.ownerId)) {
+                profileRequestCache.set(
+                    event.ownerId,
+                    getDoc(doc(db, 'publicUsers', event.ownerId)),
+                );
+            }
+
+            profileRequestCache
+                .get(event.ownerId)
+                .then(snap => {
+                    if (snap.exists()) {
+                        const data = snap.data();
+                        profileCache.set(event.ownerId, { data, cachedAt: Date.now() });
+                        profileRequestCache.delete(event.ownerId);
+                        if (!cancelled) {
+                            setHostName(data.displayName || event.organization || 'Club Name');
+                        }
+                    }
+                })
+                .catch(() => {
+                    profileRequestCache.delete(event.ownerId);
+                });
+
+            return () => {
+                cancelled = true;
+            };
+        }, [event?.ownerId, event?.organization]);
+
+        useEffect(
+            () => () => {
+                if (navigationUnlockTimerRef.current) {
+                    clearTimeout(navigationUnlockTimerRef.current);
+                }
+            },
+            [],
+        );
+
+        const navigateToDetail = () => {
+            if (!event?.id || navigationLockRef.current) return;
+
+            navigationLockRef.current = true;
+            setIsNavigatingToDetail(true);
+            navigation.navigate('EventDetail', { eventId: event.id });
+            navigationUnlockTimerRef.current = setTimeout(() => {
+                navigationLockRef.current = false;
+                setIsNavigatingToDetail(false);
+            }, 1000);
+        };
+
+        const handleRegisterPress = () => {
+            navigateToDetail();
+        };
+
+        if (!event) return null;
+
+        const flyerUrl =
+            event.detailImageUrl ||
+            event.bannerUrl ||
+            'https://dummyimage.com/400x400/cccccc/000000.png&text=No+Image';
+
+        const { isEligible: isEarlyBird, currentPrice } = getEarlyBirdInfo(event);
+
+        const isLive = new Date() >= new Date(event.startAt) && new Date() <= new Date(event.endAt);
+        const isOnlineBadge = !isLive && event.eventMode === 'online';
+
+        const renderBannerBadges = () => (
+            <>
+                {isLive && (
                     <View style={[styles.onlineBadge, { backgroundColor: theme.colors.error }]}>
                         <Ionicons name="radio-button-on" size={12} color="#fff" />
                         <Text style={styles.onlineText}>LIVE</Text>
                     </View>
-                ) : event.eventMode === 'online' ? (
+                )}
+                {isOnlineBadge && (
                     <View style={[styles.onlineBadge, { backgroundColor: theme.colors.primary }]}>
                         <Ionicons name="videocam" size={12} color="#fff" />
                         <Text style={styles.onlineText}>ONLINE</Text>
                     </View>
-                ) : null}
-
-                {/* SUSPENDED Badge */}
+                )}
                 {event.status === 'suspended' && (
                     <View style={[styles.onlineBadge, { backgroundColor: '#FF4444' }]}>
                         <Ionicons name="alert-circle" size={12} color="#fff" />
                         <Text style={styles.onlineText}>SUSPENDED</Text>
                     </View>
                 )}
+            </>
+        );
 
-                {/* Removed Top Pick badge from banner - moved to details row */}
-            </View>
-
-            {/* 2. CONTENT CONTAINER */}
-            <View style={styles.contentContainer}>
-                {/* FLYER IMAGE (Overlapping) */}
-                <View
-                    style={[
-                        styles.flyerContainer,
-                        { borderColor: theme.colors.surface, ...theme.shadows.default },
-                    ]}
-                >
-                    {!flyerLoaded && (
-                        <ShimmerItem style={[styles.flyerImage, StyleSheet.absoluteFill]} />
-                    )}
-                    <Image
-                        source={{ uri: flyerUrl }}
-                        style={styles.flyerImage}
-                        resizeMode="cover"
-                        onLoadEnd={() => setFlyerLoaded(true)}
-                    />
-                </View>
-
-                {/* HEADER INFO (Right of Flyer) */}
-                <View style={styles.headerInfo}>
-                    <Text style={[styles.title, { color: theme.colors.text }]} numberOfLines={2}>
-                        {event.title}
-                    </Text>
-                    <Text style={[styles.host, { color: theme.colors.secondary }]}>
-                        Hosted by {hostName}
-                    </Text>
-                </View>
-
-                {/* DETAILS ROW (Below Flyer) */}
-                <View style={styles.detailsRow}>
-                    {/* Date & Location */}
-                    <View style={styles.infoBlock}>
-                        <View style={styles.infoItem}>
-                            <Ionicons
-                                name="calendar"
-                                size={16}
-                                color={theme.colors.textSecondary}
-                            />
-                            <Text style={[styles.infoText, { color: theme.colors.textSecondary }]}>
-                                {month} {day} • {time}
-                            </Text>
-                        </View>
-                        <View style={styles.infoItem}>
-                            <Ionicons
-                                name="location"
-                                size={16}
-                                color={theme.colors.textSecondary}
-                            />
-                            <Text
-                                style={[styles.infoText, { color: theme.colors.textSecondary }]}
-                                numberOfLines={1}
-                            >
-                                {event.eventMode === 'online' ? 'Online' : event.location}
-                            </Text>
-                        </View>
-                        <View style={styles.infoItem}>
-                            <Ionicons
-                                name="eye-outline"
-                                size={16}
-                                color={theme.colors.textSecondary}
-                            />
-                            <Text style={[styles.infoText, { color: theme.colors.textSecondary }]}>
-                                {event.views || 0} Views
-                            </Text>
-                        </View>
-
-                        {/* Top Pick Badge - Moved here */}
-                        {isRecommended && (
-                            <View
-                                style={{
-                                    backgroundColor: '#FFD700',
-                                    paddingHorizontal: 8,
-                                    paddingVertical: 4,
-                                    borderRadius: 12,
-                                    flexDirection: 'row',
-                                    alignItems: 'center',
-                                    gap: 4,
-                                    alignSelf: 'flex-start',
-                                    marginTop: 4,
-                                    ...theme.shadows.small,
-                                }}
-                            >
-                                <Ionicons name="star" size={12} color="#000" />
-                                <Text style={{ fontSize: 10, fontWeight: 'bold', color: '#000' }}>
-                                    TOP PICK
-                                </Text>
-                            </View>
-                        )}
-
-                        {/* Early Bird Badge */}
-                        {isEarlyBird && !isRegistered && (
-                            <View
-                                style={{
-                                    backgroundColor: '#EAB30820',
-                                    paddingHorizontal: 8,
-                                    paddingVertical: 3,
-                                    borderRadius: 20,
-                                    flexDirection: 'row',
-                                    alignItems: 'center',
-                                    gap: 4,
-                                    alignSelf: 'flex-start',
-                                    marginTop: 4,
-                                    borderWidth: 1,
-                                    borderColor: '#EAB308',
-                                }}
-                            >
-                                <Text style={{ fontSize: 10, lineHeight: 14 }}>🐦</Text>
-                                <Text
-                                    style={{
-                                        fontSize: 10,
-                                        fontWeight: '700',
-                                        color: '#EAB308',
-                                        letterSpacing: 0.5,
-                                        lineHeight: 14,
-                                    }}
-                                >
-                                    EARLY BIRD
-                                </Text>
-                            </View>
-                        )}
-                    </View>
-
-                    {/* Price Badge */}
-                    <View style={[styles.priceBadge, { backgroundColor: theme.colors.secondary }]}>
-                        <Text style={styles.priceText}>
-                            {event.isPaid ? `₹${currentPrice}` : 'FREE'}
+        const renderInfoBadges = () => (
+            <>
+                {isRecommended && (
+                    <View
+                        style={{
+                            backgroundColor: '#FFD700',
+                            paddingHorizontal: 8,
+                            paddingVertical: 4,
+                            borderRadius: 12,
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            gap: 4,
+                            alignSelf: 'flex-start',
+                            marginTop: 4,
+                            ...theme.shadows.small,
+                        }}
+                    >
+                        <Ionicons name="star" size={12} color="#000" />
+                        <Text style={{ fontSize: 10, fontWeight: 'bold', color: '#000' }}>
+                            TOP PICK
                         </Text>
                     </View>
-                </View>
+                )}
+                {isEarlyBird && !isRegistered && (
+                    <View
+                        style={{
+                            backgroundColor: '#EAB30820',
+                            paddingHorizontal: 8,
+                            paddingVertical: 3,
+                            borderRadius: 20,
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            gap: 4,
+                            alignSelf: 'flex-start',
+                            marginTop: 4,
+                            borderWidth: 1,
+                            borderColor: '#EAB308',
+                        }}
+                    >
+                        <Text style={{ fontSize: 10, lineHeight: 14 }}>🐦</Text>
+                        <Text
+                            style={{
+                                fontSize: 10,
+                                fontWeight: '700',
+                                color: '#EAB308',
+                                letterSpacing: 0.5,
+                                lineHeight: 14,
+                            }}
+                        >
+                            EARLY BIRD
+                        </Text>
+                    </View>
+                )}
+            </>
+        );
 
-                {/* FOOTER ACTION */}
-                {showRegisterButton &&
-                    (isRegistered ? (
+        const renderFooter = () => {
+            if (!showRegisterButton) return null;
+            if (isRegistered) {
+                return (
+                    <View style={styles.registeredRow}>
                         <View
                             style={[
-                                styles.registerBtn,
-                                { backgroundColor: theme.colors.success, ...theme.shadows.default },
+                                styles.registerBtnCompact,
+                                {
+                                    backgroundColor: theme.colors.success,
+                                    ...theme.shadows.small,
+                                },
                             ]}
                         >
                             <Ionicons
                                 name="checkmark-circle"
-                                size={16}
+                                size={14}
                                 color="#fff"
                                 style={{ marginRight: 4 }}
                             />
-                            <Text style={styles.registerText}>REGISTERED</Text>
+                            <Text style={styles.registerTextCompact}>REGISTERED</Text>
                         </View>
+                        <View style={styles.buddyToggleContainer}>
+                            <Text style={[styles.buddyToggleLabel, { color: theme.colors.text }]}>
+                                Find A Buddy!
+                            </Text>
+                            <Switch
+                                value={lookingForBuddy}
+                                onValueChange={handleToggleBuddy}
+                                disabled={buddyLoading}
+                                trackColor={{
+                                    false: theme.colors.border,
+                                    true: theme.colors.primary + '80',
+                                }}
+                                thumbColor={lookingForBuddy ? theme.colors.primary : '#999'}
+                                style={
+                                    Platform.OS === 'ios'
+                                        ? { transform: [{ scaleX: 0.8 }, { scaleY: 0.8 }] }
+                                        : {}
+                                }
+                            />
+                        </View>
+                    </View>
+                );
+            }
+            return (
+                <TouchableOpacity
+                    style={[
+                        styles.registerBtn,
+                        {
+                            backgroundColor: isNavigatingToDetail
+                                ? theme.colors.border
+                                : theme.colors.primary,
+                            ...theme.shadows.default,
+                        },
+                    ]}
+                    accessibilityState={{ disabled: isNavigatingToDetail }}
+                    disabled={isNavigatingToDetail}
+                    onPress={handleRegisterPress}
+                    testID="event-card-register-button"
+                >
+                    {isNavigatingToDetail ? (
+                        <ActivityIndicator size="small" color="#ffffff" />
                     ) : (
-                        <TouchableOpacity
+                        <Text style={styles.registerText}>REGISTER</Text>
+                    )}
+                </TouchableOpacity>
+            );
+        };
+
+        return (
+            <TouchableOpacity
+                style={[
+                    styles.card,
+                    { backgroundColor: theme.colors.surface, ...theme.shadows.default },
+                    style,
+                ]}
+                activeOpacity={0.9}
+                onPress={navigateToDetail}
+            >
+                <View style={[styles.bannerContainer, isRecommended && { height: 140 }]}>
+                    {!bannerLoaded && (
+                        <ShimmerItem
                             style={[
-                                styles.registerBtn,
-                                { backgroundColor: theme.colors.primary, ...theme.shadows.default },
+                                styles.bannerImage,
+                                isRecommended && { height: 140 },
+                                StyleSheet.absoluteFill,
                             ]}
-                            onPress={() =>
-                                navigation.navigate('EventDetail', { eventId: event.id })
-                            }
+                        />
+                    )}
+                    <Image
+                        source={{
+                            uri:
+                                event.bannerUrl ||
+                                'https://dummyimage.com/800x400/cccccc/000000.png&text=No+Image',
+                        }}
+                        style={[styles.bannerImage, isRecommended && { height: 140 }]}
+                        resizeMode="cover"
+                        onLoadEnd={() => setBannerLoaded(true)}
+                    />
+                    <LinearGradient
+                        colors={['transparent', 'rgba(0,0,0,0.4)']}
+                        style={StyleSheet.absoluteFillObject}
+                    />
+                    <View style={[styles.categoryBadge, { backgroundColor: theme.colors.surface }]}>
+                        <Text style={[styles.categoryText, { color: theme.colors.text }]}>
+                            {event.category}
+                        </Text>
+                    </View>
+                    {renderBannerBadges()}
+                </View>
+
+                <View style={styles.contentContainer}>
+                    <View
+                        style={[
+                            styles.flyerContainer,
+                            { borderColor: theme.colors.surface, ...theme.shadows.default },
+                        ]}
+                    >
+                        {!flyerLoaded && (
+                            <ShimmerItem style={[styles.flyerImage, StyleSheet.absoluteFill]} />
+                        )}
+                        <Image
+                            source={{ uri: flyerUrl }}
+                            style={styles.flyerImage}
+                            resizeMode="cover"
+                            onLoadEnd={() => setFlyerLoaded(true)}
+                        />
+                    </View>
+                    <View style={styles.headerInfo}>
+                        <Text
+                            style={[styles.title, { color: theme.colors.text }]}
+                            numberOfLines={2}
                         >
-                            <Text style={styles.registerText}>REGISTER</Text>
-                        </TouchableOpacity>
-                    ))}
-            </View>
-        </TouchableOpacity>
-    );
-}
+                            {event.title}
+                        </Text>
+                        <Text style={[styles.host, { color: theme.colors.secondary }]}>
+                            Hosted by {hostName}
+                        </Text>
+                    </View>
+                    <View style={styles.detailsRow}>
+                        <View style={styles.infoBlock}>
+                            <View style={styles.infoItem}>
+                                <Ionicons
+                                    name="calendar"
+                                    size={16}
+                                    color={theme.colors.textSecondary}
+                                />
+                                <Text
+                                    style={[styles.infoText, { color: theme.colors.textSecondary }]}
+                                >
+                                    {formatEventDate(event.startAt)}{' '}
+                                    {formatEventTime(event.startAt)}
+                                </Text>
+                            </View>
+                            <View style={styles.infoItem}>
+                                <Ionicons
+                                    name="location"
+                                    size={16}
+                                    color={theme.colors.textSecondary}
+                                />
+                                <Text
+                                    style={[styles.infoText, { color: theme.colors.textSecondary }]}
+                                    numberOfLines={1}
+                                >
+                                    {event.eventMode === 'online' ? 'Online' : event.location}
+                                </Text>
+                            </View>
+
+                            {/* ✅ Issue #308 — views metric now uses formatMetric for correct pluralization */}
+                            <View style={styles.infoItem}>
+                                <Ionicons
+                                    name="eye-outline"
+                                    size={16}
+                                    color={theme.colors.textSecondary}
+                                />
+                                <Text
+                                    style={[styles.infoText, { color: theme.colors.textSecondary }]}
+                                >
+                                    {formatMetric(event.views, 'View', 'Views')}
+                                </Text>
+                            </View>
+                            {renderInfoBadges()}
+                        </View>
+                        <View
+                            style={[styles.priceBadge, { backgroundColor: theme.colors.secondary }]}
+                        >
+                            <Text style={styles.priceText}>
+                                {event.isPaid ? `₹${currentPrice}` : 'FREE'}
+                            </Text>
+                        </View>
+                    </View>
+                    {renderFooter()}
+                </View>
+            </TouchableOpacity>
+        );
+    },
+    arePropsEqual,
+);
 
 const styles = StyleSheet.create({
     card: {
@@ -327,8 +521,8 @@ const styles = StyleSheet.create({
         right: 16,
         paddingHorizontal: 12,
         paddingVertical: 6,
-        borderRadius: 20, // Pill
-        ...theme.shadows.small,
+        borderRadius: 20,
+        ...globalTheme.shadows.small,
     },
     categoryText: {
         fontWeight: '900',
@@ -342,11 +536,11 @@ const styles = StyleSheet.create({
         left: 16,
         paddingHorizontal: 10,
         paddingVertical: 6,
-        borderRadius: 20, // Pill
+        borderRadius: 20,
         flexDirection: 'row',
         alignItems: 'center',
         gap: 4,
-        ...theme.shadows.small,
+        ...globalTheme.shadows.small,
     },
     onlineText: {
         color: '#fff',
@@ -409,11 +603,10 @@ const styles = StyleSheet.create({
         fontSize: 12,
         fontWeight: '600',
     },
-    // New Ribbon Style for Price
     priceBadge: {
         paddingVertical: 6,
         paddingHorizontal: 12,
-        borderRadius: 20, // Pill
+        borderRadius: 20,
         borderWidth: 1,
         borderColor: 'rgba(0,0,0,0.1)',
     },
@@ -433,6 +626,28 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         width: '100%',
     },
+    registeredRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        width: '100%',
+        paddingVertical: 4,
+    },
+    registerBtnCompact: {
+        flexDirection: 'row',
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        borderRadius: 8,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    registerTextCompact: {
+        color: '#fff',
+        fontWeight: '800',
+        fontSize: 11,
+        letterSpacing: 0.5,
+        textTransform: 'uppercase',
+    },
     registerText: {
         color: '#fff',
         fontWeight: '800',
@@ -440,7 +655,18 @@ const styles = StyleSheet.create({
         letterSpacing: 0.8,
         textTransform: 'uppercase',
     },
+    buddyToggleContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 6,
+    },
+    buddyToggleLabel: {
+        fontSize: 12,
+        fontWeight: '700',
+    },
 });
+
+EventCard.displayName = 'EventCard';
 
 EventCard.propTypes = {
     event: PropTypes.object,
@@ -452,3 +678,5 @@ EventCard.propTypes = {
     showRegisterButton: PropTypes.any,
     style: PropTypes.any,
 };
+
+export default EventCard;

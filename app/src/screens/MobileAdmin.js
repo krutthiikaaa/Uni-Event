@@ -11,13 +11,18 @@ import {
     TouchableOpacity,
     View,
 } from 'react-native';
+import { BlurView } from 'expo-blur';
+import { useNavigation } from '@react-navigation/native';
 import ScreenWrapper from '../components/ScreenWrapper';
 import { db } from '../lib/firebaseConfig';
+import { formatEventDate } from '../lib/formatEventDate';
 import { useTheme } from '../lib/ThemeContext';
+import { upsertPublicProfile } from '../lib/publicProfile';
 
 export default function MobileAdmin() {
     const { theme } = useTheme();
     const styles = useMemo(() => getStyles(theme), [theme]);
+    const navigation = useNavigation();
     const [activeTab, setActiveTab] = useState('events');
     const [events, setEvents] = useState([]);
     const [requests, setRequests] = useState([]);
@@ -126,7 +131,10 @@ export default function MobileAdmin() {
     const handleApproveClub = async (reqId, ownerId) => {
         try {
             await updateDoc(doc(db, 'clubs', reqId), { approvalStatus: 'approved' });
-            if (ownerId) await updateDoc(doc(db, 'users', ownerId), { role: 'club' });
+            if (ownerId) {
+                await updateDoc(doc(db, 'users', ownerId), { role: 'club', isVerified: true });
+                await upsertPublicProfile(db, ownerId, { role: 'club', isVerified: true });
+            }
             Alert.alert('Approved', 'Club approved and user promoted.');
             fetchData();
         } catch (e) {
@@ -149,6 +157,23 @@ export default function MobileAdmin() {
         fetchData();
     };
 
+    const renderEmptyComponent = useCallback(() => {
+        let emptyMessage;
+        if (activeTab === 'events') {
+            emptyMessage = 'No active events found';
+        } else if (activeTab === 'requests') {
+            emptyMessage = 'No pending club requests';
+        } else {
+            emptyMessage = 'No pending appeals';
+        }
+        return (
+            <View style={styles.emptyContainer}>
+                <Ionicons name="search-outline" size={64} color="#666" />
+                <Text style={styles.emptyText}>{emptyMessage}</Text>
+            </View>
+        );
+    }, [activeTab, styles]);
+
     const renderEventItem = ({ item }) => (
         <View style={styles.card}>
             <View style={styles.cardHeader}>
@@ -164,7 +189,7 @@ export default function MobileAdmin() {
                 </View>
             </View>
             <Text style={styles.cardDesc}>
-                {new Date(item.startAt).toLocaleDateString()} at {item.location}
+                {formatEventDate(item.startAt)} at {item.location}
             </Text>
             <View style={styles.actionRow}>
                 <TouchableOpacity
@@ -264,6 +289,13 @@ export default function MobileAdmin() {
                     <Text style={styles.headerTitle}>Admin Dashboard</Text>
                     <Text style={styles.headerSubtitle}>Manage platform activity</Text>
                 </View>
+                <TouchableOpacity
+                    style={styles.heatmapBtn}
+                    onPress={() => navigation.navigate('LocationHeatmap')}
+                >
+                    <Ionicons name="flame" size={20} color="#fff" />
+                    <Text style={styles.heatmapBtnText}>Heatmap</Text>
+                </TouchableOpacity>
             </View>
 
             <View style={styles.tabContainer}>
@@ -302,18 +334,7 @@ export default function MobileAdmin() {
                 onRefresh={onRefresh}
                 renderItem={listRenderItem}
                 contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
-                ListEmptyComponent={
-                    <View style={styles.emptyContainer}>
-                        <Ionicons name="search-outline" size={64} color="#666" />
-                        <Text style={styles.emptyText}>
-                            {activeTab === 'events'
-                                ? 'No active events found'
-                                : activeTab === 'requests'
-                                  ? 'No pending club requests'
-                                  : 'No pending appeals'}
-                        </Text>
-                    </View>
-                }
+                ListEmptyComponent={renderEmptyComponent}
             />
 
             <Modal
@@ -322,7 +343,7 @@ export default function MobileAdmin() {
                 animationType="fade"
                 onRequestClose={() => setSuspendModalVisible(false)}
             >
-                <View style={styles.modalOverlay}>
+                <BlurView intensity={60} tint="dark" style={styles.modalOverlay}>
                     <View style={styles.modalContent}>
                         <Text style={styles.modalTitle}>Suspend Event</Text>
                         <Text style={styles.modalSubtitle}>
@@ -353,7 +374,7 @@ export default function MobileAdmin() {
                             </TouchableOpacity>
                         </View>
                     </View>
-                </View>
+                </BlurView>
             </Modal>
         </ScreenWrapper>
     );
@@ -446,10 +467,20 @@ const getStyles = theme =>
         emptyContainer: { alignItems: 'center', marginTop: 60, opacity: 0.5 },
         emptyText: { marginTop: 16, fontSize: 16, color: theme.colors.textSecondary },
 
+        heatmapBtn: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
+            backgroundColor: theme.colors.primary,
+            paddingHorizontal: 14,
+            paddingVertical: 10,
+            borderRadius: 10,
+        },
+        heatmapBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+
         // Modal Styles
         modalOverlay: {
             flex: 1,
-            backgroundColor: 'rgba(0,0,0,0.7)',
             justifyContent: 'center',
             alignItems: 'center',
             padding: 20,

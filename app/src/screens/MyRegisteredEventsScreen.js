@@ -1,24 +1,32 @@
 import { Ionicons } from '@expo/vector-icons';
 import { collection, documentId, getDocs, onSnapshot, query, where } from 'firebase/firestore';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { useIsFocused } from '@react-navigation/native';
 import { ActivityIndicator, FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import EventCard from '../components/EventCard';
+import LiquidPullToRefresh from '../components/LiquidPullToRefresh';
+import usePullToRefresh from '../hooks/usePullToRefresh';
 import { useAuth } from '../lib/AuthContext';
 import { db } from '../lib/firebaseConfig';
 import { useTheme } from '../lib/ThemeContext';
-import PropTypes from 'prop-types';
 
 export default function MyRegisteredEventsScreen() {
     const { user } = useAuth();
     const { theme } = useTheme();
+    const isFocused = useIsFocused();
     const [events, setEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [refreshNonce, setRefreshNonce] = useState(0);
+    const { pullDistance, handleScroll, handleScrollEndDrag } = usePullToRefresh(refreshing, () => {
+        setRefreshing(true);
+        setRefreshNonce(n => n + 1);
+    });
 
     useEffect(() => {
-        if (!user) {
-            setLoading(false);
+        if (!user || !isFocused) {
+            // If not focused, avoid fetching and leave current UI state intact
+            if (!user) setLoading(false);
             return;
         }
 
@@ -36,11 +44,6 @@ export default function MyRegisteredEventsScreen() {
             }
 
             // 2. Fetch Event Details for these IDs
-            // Firestore "in" query limited to 10 items. If > 10, need multiple queries or client-side filter
-            // For simplicity, we'll do client side or basic chunks.
-            // Better approach: Store minimal event data in 'participating' to avoid 2nd query?
-            // Current approach: Query 'events' where documentId IN [ids]
-
             try {
                 // Chunking for >10 items
                 const chunks = [];
@@ -72,12 +75,14 @@ export default function MyRegisteredEventsScreen() {
         });
 
         return () => unsubscribe();
-    }, [user, refreshNonce]);
+    }, [user, refreshNonce, isFocused]);
 
     const onRefresh = () => {
         setRefreshing(true);
         setRefreshNonce(n => n + 1);
     };
+
+    const renderItem = useCallback(({ item }) => <EventCard event={item} />, []);
 
     if (loading) {
         return (
@@ -108,7 +113,10 @@ export default function MyRegisteredEventsScreen() {
                         tintColor={theme.colors.primary}
                     />
                 }
-                renderItem={({ item }) => <EventCard event={item} />}
+                renderItem={renderItem}
+                onScroll={handleScroll}
+                onScrollEndDrag={handleScrollEndDrag}
+                scrollEventThrottle={16}
                 ListEmptyComponent={
                     <View style={styles.emptyState}>
                         <Ionicons
@@ -121,6 +129,11 @@ export default function MyRegisteredEventsScreen() {
                         </Text>
                     </View>
                 }
+            />
+            <LiquidPullToRefresh
+                pullDistance={pullDistance}
+                isRefreshing={refreshing}
+                color={theme.colors.primary}
             />
         </View>
     );
@@ -136,7 +149,3 @@ const styles = StyleSheet.create({
     emptyState: { alignItems: 'center', marginTop: 100 },
     emptyText: { marginTop: 10, fontSize: 16 },
 });
-
-MyRegisteredEventsScreen.propTypes = {
-    navigation: PropTypes.object,
-};

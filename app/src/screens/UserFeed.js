@@ -1,11 +1,24 @@
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { collection, limit, onSnapshot, query, where } from 'firebase/firestore';
-import { useEffect, useRef, useState } from 'react';
+import {
+    collection,
+    limit,
+    onSnapshot,
+    query,
+    where,
+    getDocs,
+    orderBy,
+    startAfter,
+    collectionGroup,
+} from 'firebase/firestore';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import PropTypes from 'prop-types';
 import {
     Animated,
+    ActivityIndicator,
+    Alert,
     Platform,
-    RefreshControl,
     ScrollView,
     Share,
     StyleSheet,
@@ -16,13 +29,164 @@ import {
 } from 'react-native';
 import EventCard from '../components/EventCard';
 import FeedbackModal from '../components/FeedbackModal';
-import { EventListSkeleton } from '../components/SkeletonLoader';
+import LiquidPullToRefresh from '../components/LiquidPullToRefresh';
+import SkeletonLoader from '../components/SkeletonLoader';
 import { useAuth } from '../lib/AuthContext';
 import { submitFeedback } from '../lib/feedbackService';
 import { db } from '../lib/firebaseConfig';
 import { useTheme } from '../lib/ThemeContext';
+import { useIsFocused } from '@react-navigation/native';
 
 const FILTERS = ['Upcoming', 'Past', 'Cultural', 'Sports', 'Tech', 'Workshop', 'Seminar'];
+
+const UserFeedStickyHeader = ({
+    theme,
+    searchQuery,
+    setSearchQuery,
+    updateHistory,
+    setShowHistory,
+    showHistory,
+    searchHistory,
+    clearHistory,
+    persistSearchHistory,
+    activeFilter,
+    setActiveFilter,
+}) => (
+    <View style={{ backgroundColor: theme.colors.background, paddingBottom: 10 }}>
+        <View
+            style={[
+                styles.searchContainer,
+                { backgroundColor: theme.colors.surface, ...theme.shadows.small },
+            ]}
+        >
+            <Ionicons name="search" size={20} color={theme.colors.textSecondary} />
+            <TextInput
+                style={[styles.searchInput, { color: theme.colors.text }]}
+                placeholder="Search events..."
+                placeholderTextColor={theme.colors.textSecondary}
+                value={searchQuery}
+                onChangeText={text => {
+                    setSearchQuery(text);
+                    updateHistory(text);
+                    if (text.trim() !== '') setShowHistory(false);
+                }}
+                onFocus={() => {
+                    if (searchQuery.trim() === '') setShowHistory(true);
+                }}
+                onBlur={() => {
+                    setShowHistory(false);
+                    persistSearchHistory(searchQuery);
+                }}
+                onSubmitEditing={() => {
+                    persistSearchHistory(searchQuery);
+                }}
+            />
+            {searchQuery.length > 0 && (
+                <TouchableOpacity onPress={() => setSearchQuery('')} testID="clear-search-button">
+                    <Ionicons name="close-circle" size={20} color={theme.colors.textSecondary} />
+                </TouchableOpacity>
+            )}
+        </View>
+        {showHistory && searchHistory.length > 0 && (
+            <View style={styles.historyContainer}>
+                <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.historyScroll}
+                >
+                    {searchHistory.map(qh => (
+                        <TouchableOpacity
+                            key={qh}
+                            style={styles.historyChip}
+                            onPress={() => {
+                                setSearchQuery(qh);
+                                setShowHistory(false);
+                            }}
+                        >
+                            <Text style={styles.historyChipText}>{qh}</Text>
+                        </TouchableOpacity>
+                    ))}
+                </ScrollView>
+                <TouchableOpacity
+                    onPress={clearHistory}
+                    style={styles.clearHistoryBtn}
+                    accessible={true}
+                    accessibilityRole="button"
+                    accessibilityLabel="Clear search history"
+                    accessibilityHint="Deletes all saved search history"
+                >
+                    <Ionicons name="trash-outline" size={18} color={theme.colors.textSecondary} />
+                </TouchableOpacity>
+            </View>
+        )}
+
+        <View style={styles.filterWrapper}>
+            <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.filterContent}
+            >
+                {FILTERS.map(f => {
+                    const isActive = activeFilter === f;
+                    return (
+                        <TouchableOpacity
+                            key={f}
+                            onPress={() => setActiveFilter(f)}
+                            style={{
+                                marginRight: 10,
+                                borderRadius: 25,
+                                ...theme.shadows.small,
+                            }}
+                        >
+                            {isActive ? (
+                                <LinearGradient
+                                    colors={[
+                                        theme.colors.primary,
+                                        theme.colors.secondary || '#FFC107',
+                                    ]}
+                                    start={{ x: 0, y: 0 }}
+                                    end={{ x: 1, y: 0 }}
+                                    style={styles.chip}
+                                >
+                                    <Text style={[styles.chipText, { color: '#fff' }]}>{f}</Text>
+                                </LinearGradient>
+                            ) : (
+                                <View
+                                    style={[styles.chip, { backgroundColor: theme.colors.surface }]}
+                                >
+                                    <Text
+                                        style={[
+                                            styles.chipText,
+                                            { color: theme.colors.textSecondary },
+                                        ]}
+                                    >
+                                        {f}
+                                    </Text>
+                                </View>
+                            )}
+                        </TouchableOpacity>
+                    );
+                })}
+            </ScrollView>
+        </View>
+    </View>
+);
+
+UserFeedStickyHeader.propTypes = {
+    theme: PropTypes.object.isRequired,
+    searchQuery: PropTypes.string.isRequired,
+    setSearchQuery: PropTypes.func.isRequired,
+    updateHistory: PropTypes.func.isRequired,
+    setShowHistory: PropTypes.func.isRequired,
+    showHistory: PropTypes.bool.isRequired,
+    searchHistory: PropTypes.array.isRequired,
+    clearHistory: PropTypes.func.isRequired,
+    persistSearchHistory: PropTypes.func.isRequired,
+    activeFilter: PropTypes.string.isRequired,
+    setActiveFilter: PropTypes.func.isRequired,
+};
+
+const PAGE_SIZE = 10;
 
 export default function UserFeed() {
     const { user, userData, role } = useAuth();
@@ -30,30 +194,161 @@ export default function UserFeed() {
     const [events, setEvents] = useState([]);
     const [participatingIds, setParticipatingIds] = useState([]); // Track joined events
     const [activeFilter, setActiveFilter] = useState('Upcoming');
+    const [searchHistory, setSearchHistory] = useState([]);
+    const [showHistory, setShowHistory] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
+    const [debouncedQuery, setDebouncedQuery] = useState(''); // filtering — 300ms debounced
+    const debounceTimer = useRef(null);
     const [loading, setLoading] = useState(true);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [hasMore, setHasMore] = useState(true);
+    const lastVisibleRef = useRef(null);
     const [refreshing, setRefreshing] = useState(false);
-    const [refreshNonce, setRefreshNonce] = useState(0);
-
-    // Feedback Modal State
     const [showFeedbackModal, setShowFeedbackModal] = useState(false);
     const [currentFeedbackRequest, setCurrentFeedbackRequest] = useState(null);
-
     const scrollY = useRef(new Animated.Value(0)).current;
 
-    // Listen for my registrations
+    const [followingIds, setFollowingIds] = useState([]);
+    const [friendsEvents, setFriendsEvents] = useState([]);
+
+    const isFocused = useIsFocused();
+
+    //  debounce effect
+    // Debounce effect — 300ms delay before dispatching query to filter (#304)
     useEffect(() => {
-        if (!user) return;
-        const q = collection(db, 'users', user.uid, 'participating');
-        const unsub = onSnapshot(q, snap => {
+        if (debounceTimer.current) clearTimeout(debounceTimer.current);
+        debounceTimer.current = setTimeout(() => {
+            setDebouncedQuery(searchQuery);
+        }, 300);
+        return () => clearTimeout(debounceTimer.current);
+    }, [searchQuery]);
+
+    // Load persisted search history on component mount
+    useEffect(() => {
+        const loadHistory = async () => {
+            try {
+                const stored = await AsyncStorage.getItem('searchHistory');
+                if (stored) {
+                    setSearchHistory(JSON.parse(stored));
+                }
+            } catch (e) {
+                console.error('Failed to load search history', e);
+            }
+        };
+        loadHistory();
+    }, []);
+
+    const participatingIDSet = useMemo(() => new Set(participatingIds), [participatingIds]);
+
+    const updateHistory = useCallback(query => {
+        if (!query) return;
+        setSearchHistory(prev => {
+            const filtered = prev.filter(q => q !== query);
+            return [query, ...filtered].slice(0, 5);
+        });
+    }, []);
+
+    // Persist search history to AsyncStorage (called on submit/blur)
+    const persistSearchHistory = useCallback(async raw => {
+        const normalized = raw?.trim();
+        if (!normalized) return;
+        setSearchHistory(prev => {
+            const filtered = prev.filter(q => q !== normalized);
+            const newHist = [normalized, ...filtered].slice(0, 5);
+            AsyncStorage.setItem('searchHistory', JSON.stringify(newHist)).catch(e =>
+                console.error('Failed to save search history', e),
+            );
+            return newHist;
+        });
+    }, []);
+
+    // Clear history handler
+    const clearHistory = useCallback(async () => {
+        try {
+            await AsyncStorage.removeItem('searchHistory');
+        } catch (e) {
+            console.error('Failed to clear search history', e);
+        }
+        setSearchHistory([]);
+    }, []);
+    useEffect(() => {
+        if (!user || !isFocused) return;
+        const participatingQuery = collection(db, 'users', user.uid, 'participating');
+        const unsub = onSnapshot(participatingQuery, snap => {
             setParticipatingIds(snap.docs.map(d => d.id));
         });
         return unsub;
-    }, [user]);
+    }, [user, isFocused]);
+
+    // Fetch Following IDs
+    useEffect(() => {
+        if (!user || !isFocused) return;
+        const q = collection(db, 'users', user.uid, 'following');
+        const unsub = onSnapshot(q, snapshot => {
+            setFollowingIds(snapshot.docs.map(d => d.id));
+        });
+        return unsub;
+    }, [user, isFocused]);
+
+    // Fetch Friends' Events
+    useEffect(() => {
+        const fetchFriendsEvents = async () => {
+            if (followingIds.length === 0) {
+                setFriendsEvents([]);
+                return;
+            }
+
+            try {
+                const topFriends = followingIds.slice(0, 10);
+                const q = query(
+                    collectionGroup(db, 'participants'),
+                    where('userId', 'in', topFriends),
+                );
+                const snapshot = await getDocs(q);
+
+                const eventIds = new Set();
+                snapshot.docs.forEach(doc => {
+                    const eventId = doc.ref.parent?.parent?.id;
+                    if (eventId) eventIds.add(eventId);
+                });
+
+                if (eventIds.size === 0) {
+                    setFriendsEvents([]);
+
+                    return;
+                }
+
+                const fetchIds = Array.from(eventIds).slice(0, 10);
+                // Cannot query __name__ in with more than 10, so sliced to 10
+                const qEvents = query(collection(db, 'events'), where('__name__', 'in', fetchIds));
+                const evSnap = await getDocs(qEvents);
+
+                const now = new Date();
+                const fetchedEvents = [];
+                evSnap.docs.forEach(doc => {
+                    const data = doc.data();
+                    if (data.status === 'suspended' || data.deletedAt != null) return;
+
+                    const end = data.endAt
+                        ? new Date(data.endAt)
+                        : new Date(new Date(data.startAt).getTime() + 24 * 60 * 60 * 1000);
+                    if (end >= now) {
+                        fetchedEvents.push({ id: doc.id, ...data });
+                    }
+                });
+
+                fetchedEvents.sort((a, b) => new Date(a.startAt) - new Date(b.startAt));
+                setFriendsEvents(fetchedEvents);
+            } catch (e) {
+                console.error('Error fetching friends events:', e);
+            }
+        };
+        fetchFriendsEvents();
+    }, [followingIds]);
 
     // Listen for pending feedback requests
     useEffect(() => {
-        if (!user) return;
+        if (!user || !isFocused) return;
 
         const feedbackQuery = query(
             collection(db, 'feedbackRequests'),
@@ -78,42 +373,69 @@ export default function UserFeed() {
         );
 
         return () => unsubscribe();
-    }, [user]);
+    }, [user, isFocused]);
 
-    useEffect(() => {
-        if (!user) {
+    const fetchEventsPage = useCallback(async cursorDoc => {
+        const constraints = [orderBy('startAt', 'desc')];
+        if (cursorDoc) {
+            constraints.push(startAfter(cursorDoc));
+        }
+        constraints.push(limit(PAGE_SIZE + 1));
+        const eventsQuery = query(collection(db, 'events'), ...constraints);
+        const snapshot = await getDocs(eventsQuery);
+        const docs = snapshot.docs;
+        const hasNextPage = docs.length > PAGE_SIZE;
+        const pageDocs = hasNextPage ? docs.slice(0, PAGE_SIZE) : docs;
+        const list = [];
+        pageDocs.forEach(doc => {
+            const data = doc.data();
+            if (data.status === 'suspended') return;
+            if (data.deletedAt != null) return;
+            list.push({ id: doc.id, ...data });
+        });
+        const lastDoc = pageDocs.length > 0 ? pageDocs[pageDocs.length - 1] : null;
+        return { list, lastDoc: lastDoc || null, hasNextPage };
+    }, []);
+
+    const loadInitialEvents = useCallback(async () => {
+        if (!user || !isFocused) {
             setLoading(false);
             return;
         }
+        setLoading(true);
+        try {
+            const { list, lastDoc, hasNextPage } = await fetchEventsPage(null);
+            setEvents(list);
+            lastVisibleRef.current = lastDoc;
+            setHasMore(hasNextPage);
+        } catch (error) {
+            console.log('Event Fetch Error', error);
+        } finally {
+            setLoading(false);
+        }
+    }, [user, isFocused, fetchEventsPage]);
 
-        // Fetching events. ideally separate query.
-        const q = query(collection(db, 'events'));
+    const loadMore = useCallback(async () => {
+        if (loadingMore || !hasMore) return;
+        setLoadingMore(true);
+        try {
+            const { list, lastDoc, hasNextPage } = await fetchEventsPage(lastVisibleRef.current);
+            setEvents(prev => [...prev, ...list]);
+            lastVisibleRef.current = lastDoc;
+            setHasMore(hasNextPage);
+        } catch (error) {
+            console.log('Load More Error', error);
+        } finally {
+            setLoadingMore(false);
+        }
+    }, [loadingMore, hasMore, fetchEventsPage]);
 
-        const unsubscribe = onSnapshot(
-            q,
-            snapshot => {
-                const list = [];
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    if (data.status === 'suspended') return;
-                    list.push({ id: doc.id, ...data });
-                });
-                setEvents(list);
-                setLoading(false);
-                setRefreshing(false);
-            },
-            error => {
-                console.log('Error fetching events: ', error);
-                setLoading(false);
-                setRefreshing(false);
-            },
-        );
-
-        return () => unsubscribe();
-    }, [role, user, refreshNonce]);
+    useEffect(() => {
+        loadInitialEvents();
+    }, [loadInitialEvents]);
 
     // Recommendation Logic: Views + User History + Freshness
-    const getRecommendedEvents = () => {
+    const getRecommendedEvents = useMemo(() => {
         const now = new Date();
         const upcomingEvents = events.filter(e => new Date(e.startAt) >= now);
 
@@ -122,7 +444,7 @@ export default function UserFeed() {
         // 1. Analyze User History (Favorite Categories)
         const categoryCounts = {};
         events
-            .filter(e => participatingIds.includes(e.id))
+            .filter(e => participatingIDSet.has(e.id))
             .forEach(e => {
                 if (e.category) {
                     categoryCounts[e.category] = (categoryCounts[e.category] || 0) + 1;
@@ -162,15 +484,15 @@ export default function UserFeed() {
 
         // 3. Sort by Score Descending
         return scoredEvents.sort((a, b) => b.score - a.score).slice(0, 3);
-    };
+    }, [events, participatingIDSet]);
 
     const getFilteredEvents = () => {
         const now = new Date();
         let filtered = events;
 
         // 0. Search Query Filtering
-        if (searchQuery.trim()) {
-            const query = searchQuery.toLowerCase();
+        if (debouncedQuery.trim()) {
+            const query = debouncedQuery.toLowerCase();
             filtered = filtered.filter(
                 e =>
                     e.title?.toLowerCase().includes(query) ||
@@ -180,7 +502,7 @@ export default function UserFeed() {
         }
 
         // 1. Strict Profile Filtering (Department & Year)
-        if (role === 'student' && userData && userData.branch && userData.year) {
+        if (role === 'student' && userData?.branch && userData?.year) {
             // Only filter if we have complete user data
             filtered = filtered.filter(e => {
                 // Check Department
@@ -241,101 +563,44 @@ export default function UserFeed() {
 
     const displayList = getFilteredEvents();
 
-    const onRefresh = () => {
+    const onRefresh = useCallback(async () => {
+        if (!user) return;
         setRefreshing(true);
-        setRefreshNonce(n => n + 1);
-    };
+        try {
+            const { list, lastDoc, hasNextPage } = await fetchEventsPage(null);
+            setEvents(list);
+            lastVisibleRef.current = lastDoc;
+            setHasMore(hasNextPage);
+        } catch (error) {
+            console.error('Refresh error:', error);
+            Alert.alert('Error', 'Failed to refresh events.');
+        } finally {
+            setRefreshing(false);
+        }
+    }, [user, fetchEventsPage]);
 
-    const StickyHeader = () => (
-        <View style={{ backgroundColor: theme.colors.background, paddingBottom: 10 }}>
-            {/* Search Bar - Floating Pill */}
-            <View
-                style={[
-                    styles.searchContainer,
-                    { backgroundColor: theme.colors.surface, ...theme.shadows.small },
-                ]}
-            >
-                <Ionicons name="search" size={20} color={theme.colors.textSecondary} />
-                <TextInput
-                    style={[styles.searchInput, { color: theme.colors.text }]}
-                    placeholder="Search events..."
-                    placeholderTextColor={theme.colors.textSecondary}
-                    value={searchQuery}
-                    onChangeText={setSearchQuery}
-                />
-                {searchQuery.length > 0 && (
-                    <TouchableOpacity onPress={() => setSearchQuery('')}>
-                        <Ionicons
-                            name="close-circle"
-                            size={20}
-                            color={theme.colors.textSecondary}
-                        />
-                    </TouchableOpacity>
-                )}
-            </View>
+    const [pullDistance, setPullDistance] = useState(0);
+    const lastPullRef = useRef(0);
 
-            <View style={styles.filterWrapper}>
-                <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    contentContainerStyle={styles.filterContent}
-                >
-                    {FILTERS.map(f => {
-                        const isActive = activeFilter === f;
-                        return (
-                            <TouchableOpacity
-                                key={f}
-                                onPress={() => setActiveFilter(f)}
-                                style={{
-                                    marginRight: 10,
-                                    borderRadius: 25,
-                                    ...theme.shadows.small,
-                                }}
-                            >
-                                {isActive ? (
-                                    <LinearGradient
-                                        colors={[
-                                            theme.colors.primary,
-                                            theme.colors.secondary || '#FFC107',
-                                        ]}
-                                        start={{ x: 0, y: 0 }}
-                                        end={{ x: 1, y: 0 }}
-                                        style={styles.chip}
-                                    >
-                                        <Text style={[styles.chipText, { color: '#fff' }]}>
-                                            {f}
-                                        </Text>
-                                    </LinearGradient>
-                                ) : (
-                                    <View
-                                        style={[
-                                            styles.chip,
-                                            { backgroundColor: theme.colors.surface },
-                                        ]}
-                                    >
-                                        <Text
-                                            style={[
-                                                styles.chipText,
-                                                { color: theme.colors.textSecondary },
-                                            ]}
-                                        >
-                                            {f}
-                                        </Text>
-                                    </View>
-                                )}
-                            </TouchableOpacity>
-                        );
-                    })}
-                </ScrollView>
-            </View>
-        </View>
-    );
+    useEffect(() => {
+        const listenerId = scrollY.addListener(({ value }) => {
+            lastPullRef.current = Math.max(0, -value);
+            setPullDistance(lastPullRef.current);
+        });
+        return () => scrollY.removeListener(listenerId);
+    }, [scrollY]);
+
+    const handleScrollEndDrag = useCallback(() => {
+        if (lastPullRef.current >= 80 && !refreshing) {
+            onRefresh();
+        }
+    }, [refreshing, onRefresh]);
 
     const renderEvent = ({ item }) => (
         <View style={{ paddingHorizontal: 20 }}>
             <EventCard
                 event={item}
-                isRegistered={participatingIds.includes(item.id)}
+                isRegistered={participatingIDSet.has(item.id)}
                 onLike={() => {}}
                 onShare={async () => {
                     try {
@@ -343,7 +608,8 @@ export default function UserFeed() {
                             message: `Check out this event: ${item.title} at ${item.location}!`,
                         });
                     } catch (e) {
-                        console.log(e);
+                        console.error('Share Error:', e);
+                        Alert.alert('Error', 'Failed to share the event.');
                     }
                 }}
             />
@@ -358,6 +624,24 @@ export default function UserFeed() {
 
     const renderHeader = () => (
         <Animated.View style={{ transform: [{ translateY: headerTranslateY }] }}>
+            {/* Friends Events Rail */}
+            {friendsEvents.length > 0 && (
+                <View style={{ marginBottom: 20 }}>
+                    <Text style={styles.sectionTitle}>YOUR FRIENDS ARE GOING</Text>
+                    <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={{ paddingHorizontal: 20 }}
+                    >
+                        {friendsEvents.map(event => (
+                            <View key={event.id} style={{ width: 320, marginRight: 15 }}>
+                                <EventCard event={event} isRecommended={false} />
+                            </View>
+                        ))}
+                    </ScrollView>
+                </View>
+            )}
+
             {/* Recommendations Rail */}
             <View style={{ marginBottom: 20 }}>
                 <Text style={styles.sectionTitle}>RECOMMENDED FOR YOU</Text>
@@ -366,12 +650,12 @@ export default function UserFeed() {
                     showsHorizontalScrollIndicator={false}
                     contentContainerStyle={{ paddingHorizontal: 20 }}
                 >
-                    {getRecommendedEvents().map(event => (
+                    {getRecommendedEvents.map(event => (
                         <View key={event.id} style={{ width: 320, marginRight: 15 }}>
                             <EventCard event={event} isRecommended={true} />
                         </View>
                     ))}
-                    {getRecommendedEvents().length === 0 && (
+                    {getRecommendedEvents.length === 0 && (
                         <Text
                             style={{
                                 color: theme.colors.textSecondary,
@@ -387,31 +671,55 @@ export default function UserFeed() {
         </Animated.View>
     );
 
+    const renderStickyHeader = useCallback(
+        () => (
+            <UserFeedStickyHeader
+                theme={theme}
+                searchQuery={searchQuery}
+                setSearchQuery={setSearchQuery}
+                updateHistory={updateHistory}
+                setShowHistory={setShowHistory}
+                showHistory={showHistory}
+                searchHistory={searchHistory}
+                clearHistory={clearHistory}
+                persistSearchHistory={persistSearchHistory}
+                activeFilter={activeFilter}
+                setActiveFilter={setActiveFilter}
+            />
+        ),
+        [
+            theme,
+            searchQuery,
+            setSearchQuery,
+            updateHistory,
+            setShowHistory,
+            showHistory,
+            searchHistory,
+            clearHistory,
+            persistSearchHistory,
+            activeFilter,
+            setActiveFilter,
+        ],
+    );
+
     return (
         <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
             {loading ? (
                 <View style={{ paddingTop: 20 }}>
-                    <EventListSkeleton />
+                    <SkeletonLoader />
                 </View>
             ) : (
                 <Animated.SectionList
                     sections={[{ data: displayList }]}
                     keyExtractor={item => item.id}
                     renderItem={renderEvent}
-                    renderSectionHeader={StickyHeader}
+                    renderSectionHeader={renderStickyHeader}
                     ListHeaderComponent={renderHeader}
                     stickySectionHeadersEnabled={true}
-                    refreshControl={
-                        <RefreshControl
-                            refreshing={refreshing}
-                            onRefresh={onRefresh}
-                            colors={[theme.colors.primary]}
-                            tintColor={theme.colors.primary}
-                        />
-                    }
                     onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], {
                         useNativeDriver: true,
                     })}
+                    onScrollEndDrag={handleScrollEndDrag}
                     contentContainerStyle={{ paddingBottom: 100 }}
                     ListEmptyComponent={
                         <View style={styles.emptyContainer}>
@@ -428,8 +736,31 @@ export default function UserFeed() {
                             </Text>
                         </View>
                     }
+                    ListFooterComponent={
+                        hasMore && events.length > 0 ? (
+                            <TouchableOpacity
+                                style={styles.loadMoreBtn}
+                                onPress={loadMore}
+                                disabled={loadingMore}
+                            >
+                                {loadingMore ? (
+                                    <ActivityIndicator color="#fff" />
+                                ) : (
+                                    <Text style={styles.loadMoreText}>Load More</Text>
+                                )}
+                            </TouchableOpacity>
+                        ) : events.length > 0 ? (
+                            <Text style={styles.endText}>You&apos;ve reached the end</Text>
+                        ) : null
+                    }
                 />
             )}
+
+            <LiquidPullToRefresh
+                pullDistance={pullDistance}
+                isRefreshing={refreshing}
+                color={theme.colors.primary}
+            />
 
             {/* Feedback Modal */}
             <FeedbackModal
@@ -479,8 +810,28 @@ const styles = StyleSheet.create({
             web: { outlineStyle: 'none' },
         }),
     },
-    filterWrapper: {
-        height: 60,
+    historyContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        marginHorizontal: 20,
+        marginBottom: 10,
+    },
+    historyScroll: {
+        flexGrow: 0,
+    },
+    historyChip: {
+        backgroundColor: '#eee',
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 15,
+        marginRight: 8,
+    },
+    historyChipText: {
+        fontSize: 13,
+        color: '#333',
+    },
+    clearHistoryBtn: {
+        marginLeft: 8,
     },
     filterContent: {
         paddingHorizontal: 20,
@@ -507,4 +858,20 @@ const styles = StyleSheet.create({
     },
     emptyContainer: { alignItems: 'center', marginTop: 50, padding: 20 },
     emptyText: { marginTop: 10, fontSize: 16 },
+    loadMoreBtn: {
+        backgroundColor: '#6C63FF',
+        paddingVertical: 14,
+        paddingHorizontal: 40,
+        borderRadius: 25,
+        alignSelf: 'center',
+        marginVertical: 20,
+    },
+    loadMoreText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+    endText: {
+        textAlign: 'center',
+        marginVertical: 20,
+        fontSize: 13,
+        opacity: 0.5,
+        color: '#fff',
+    },
 });

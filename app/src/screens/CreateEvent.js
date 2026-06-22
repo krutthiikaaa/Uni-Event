@@ -1,13 +1,25 @@
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
-import { addDoc, collection, updateDoc, doc } from 'firebase/firestore';
+import {
+    collection,
+    getDocs,
+    updateDoc,
+    doc,
+    query,
+    runTransaction,
+    increment,
+    serverTimestamp,
+    setDoc,
+    where,
+} from 'firebase/firestore';
 import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     ActivityIndicator,
     Alert,
     Image,
+    Modal,
     Platform,
     ScrollView,
     StyleSheet,
@@ -21,8 +33,21 @@ import PremiumInput from '../components/PremiumInput'; // Using the existing com
 import { useAuth } from '../lib/AuthContext';
 import * as CalendarService from '../lib/CalendarService';
 import { db, storage } from '../lib/firebaseConfig';
+import { formatEventDate, formatEventTime } from '../lib/formatEventDate';
 import { useTheme } from '../lib/ThemeContext';
+import { extractTags } from '../lib/tagExtractor';
+import { predictAttendance } from '../lib/capacityPredictor';
+import { enforceRateLimit } from '../lib/rateLimiter';
 import PropTypes from 'prop-types';
+import EventPreview from '../components/EventPreview';
+
+let MapView = null;
+let Marker = null;
+if (Platform.OS !== 'web') {
+    const Maps = require('react-native-maps');
+    MapView = Maps.default;
+    Marker = Maps.Marker;
+}
 
 const DEFAULT_BANNERS = [
     'https://images.unsplash.com/photo-1540575467063-178a50c2df87?auto=format&fit=crop&w=1000&q=80',
@@ -41,12 +66,19 @@ export default function CreateEvent({ navigation, route }) {
     const styles = useMemo(() => getStyles(theme), [theme]);
 
     const [loading, setLoading] = useState(false);
+    const [templateLoading, setTemplateLoading] = useState(false);
+    const [templateModalVisible, setTemplateModalVisible] = useState(false);
+    const [templates, setTemplates] = useState([]);
+    const [showPreview, setShowPreview] = useState(false);
 
     // Form State
     const [title, setTitle] = useState('');
     const [description, setDescription] = useState('');
+    const [suggestedTags, setSuggestedTags] = useState([]);
+    const [selectedTags, setSelectedTags] = useState([]);
     const [category, setCategory] = useState('');
     const [location, setLocation] = useState('');
+    const [coordinates, setCoordinates] = useState(null);
 
     // Target
     const [targetBranches, setTargetBranches] = useState(['All']);
@@ -56,6 +88,11 @@ export default function CreateEvent({ navigation, route }) {
     const [startDate, setStartDate] = useState(new Date());
     const [endDate, setEndDate] = useState(new Date(Date.now() + 3600000)); // +1 hour default
     const [showStartPicker, setShowStartPicker] = useState(false);
+    useEffect(() => {
+        if (endDate.getTime() <= startDate.getTime()) {
+            setEndDate(new Date(startDate.getTime() + 60 * 60 * 1000));
+        }
+    }, [startDate, endDate]);
     const [showEndPicker, setShowEndPicker] = useState(false);
     const [dateMode, setDateMode] = useState('date');
 
@@ -68,6 +105,8 @@ export default function CreateEvent({ navigation, route }) {
     const [registrationLink, setRegistrationLink] = useState('');
     const [maxParticipants, setMaxParticipants] = useState('');
     const [imageUri, setImageUri] = useState(null);
+    const [capacity, setCapacity] = useState('');
+    const [capacityWarning, setCapacityWarning] = useState(null);
 
     // Custom Form
     const [useCustomForm, setUseCustomForm] = useState(false);
@@ -75,9 +114,15 @@ export default function CreateEvent({ navigation, route }) {
 
     // Google Auth
     const { request, response, promptAsync } = CalendarService.useCalendarAuth();
+    const meetAuthInProgressRef = useRef(false);
 
-    const handleGenerateMeetLink = async () => {
+    // Submit may request a Meet link while the form is loading; direct user taps stay blocked.
+    const handleGenerateMeetLink = async ({ allowWhileSubmitting = false } = {}) => {
+        if (loading && !allowWhileSubmitting) return null;
+        if (meetAuthInProgressRef.current) return null;
+
         try {
+            meetAuthInProgressRef.current = true;
             const authResult = await promptAsync();
             const token =
                 authResult?.authentication?.accessToken ||
@@ -106,10 +151,14 @@ export default function CreateEvent({ navigation, route }) {
         } catch (error) {
             Alert.alert('Error', error.message || 'Failed to generate Meet link');
             return null;
+        } finally {
+            meetAuthInProgressRef.current = false;
         }
     };
 
     const pickImage = async () => {
+        if (loading) return;
+
         let result = await ImagePicker.launchImageLibraryAsync({
             mediaTypes: ImagePicker.MediaTypeOptions.Images,
             allowsEditing: true,
@@ -129,6 +178,8 @@ export default function CreateEvent({ navigation, route }) {
     };
 
     const toggleBranch = b => {
+        if (loading) return;
+
         if (b === 'All') {
             setTargetBranches(['All']);
             return;
@@ -140,19 +191,167 @@ export default function CreateEvent({ navigation, route }) {
     };
 
     const toggleYear = y => {
+        if (loading) return;
+
         if (targetYears.includes(y)) setTargetYears(targetYears.filter(x => x !== y));
         else setTargetYears([...targetYears, y]);
     };
 
-    const { event } = route.params || {};
+    const { event, template } = route.params || {};
     const isEditMode = !!event;
+    let submitLabel = isEditMode ? 'Update Event' : 'Create Event';
+    if (loading) {
+        submitLabel = isEditMode ? 'Updating Event...' : 'Creating Event...';
+    }
+
+    useEffect(() => {
+        const tags = extractTags(description);
+        setSuggestedTags(tags);
+    }, [description]);
+
+    useEffect(() => {
+        const cap = Number.parseInt(capacity, 10);
+        if (!cap || cap <= 0) {
+            setCapacityWarning(null);
+            return;
+        }
+        let timer = setTimeout(async () => {
+            const result = await predictAttendance({
+                category,
+                rsvpCount: 0,
+                capacity: cap,
+            });
+            setCapacityWarning(result);
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [capacity, category]);
+
+    const toggleTag = tag => {
+        if (loading) return;
+
+        setSelectedTags(prev =>
+            prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag],
+        );
+    };
+
+    const applyTemplate = selectedTemplate => {
+        if (!selectedTemplate) return;
+
+        setTitle(selectedTemplate.title || '');
+        setDescription(selectedTemplate.description || '');
+        setSelectedTags(selectedTemplate.tags || []);
+        setCategory(selectedTemplate.category || '');
+        setLocation(selectedTemplate.location || '');
+        setCoordinates(selectedTemplate.coordinates || null);
+        setTargetBranches(selectedTemplate.target?.departments || ['All']);
+        setTargetYears(selectedTemplate.target?.years || []);
+        setEventMode(selectedTemplate.eventMode || 'offline');
+        setMeetLink(selectedTemplate.meetLink || '');
+        setIsPaid(!!selectedTemplate.isPaid);
+        setPrice(selectedTemplate.price?.toString() || '');
+        setUpiId(selectedTemplate.upiId || '');
+        setRegistrationLink(selectedTemplate.registrationLink || '');
+        setImageUri(selectedTemplate.bannerUrl || null);
+        setCapacity(selectedTemplate.capacity?.toString() || '');
+        setUseCustomForm(!!selectedTemplate.hasCustomForm);
+        setCustomFormSchema(selectedTemplate.customFormSchema || []);
+        setTemplateModalVisible(false);
+    };
+
+    const fetchTemplates = async () => {
+        if (!user?.uid) {
+            Alert.alert('Login Required', 'Please login to use event templates.');
+            return;
+        }
+
+        setTemplateLoading(true);
+        try {
+            const templatesQuery = query(
+                collection(db, 'eventTemplates'),
+                where('ownerId', '==', user.uid),
+            );
+            const snapshot = await getDocs(templatesQuery);
+            const nextTemplates = snapshot.docs
+                .map(templateDoc => ({ id: templateDoc.id, ...templateDoc.data() }))
+                .sort((a, b) => {
+                    const left = a.createdAt?.toMillis?.() || 0;
+                    const right = b.createdAt?.toMillis?.() || 0;
+                    return right - left;
+                });
+
+            setTemplates(nextTemplates);
+            setTemplateModalVisible(true);
+        } catch (error) {
+            console.error('Template fetch failed:', error);
+            Alert.alert('Error', 'Failed to load templates.');
+        } finally {
+            setTemplateLoading(false);
+        }
+    };
+
+    const saveAsTemplate = async () => {
+        if (loading || templateLoading) return;
+
+        if (!user?.uid) {
+            Alert.alert('Login Required', 'Please login to save templates.');
+            return;
+        }
+        if (!title.trim() || !description.trim() || !category) {
+            Alert.alert('Missing Info', 'Please fill Title, Description and Category.');
+            return;
+        }
+
+        setTemplateLoading(true);
+        try {
+            const templateData = {
+                title: title.trim(),
+                description: description.trim(),
+                tags: selectedTags,
+                category,
+                location: eventMode === 'online' ? 'Google Meet' : location,
+                coordinates: eventMode === 'offline' && coordinates ? coordinates : null,
+                eventMode,
+                meetLink: eventMode === 'online' ? meetLink : null,
+                isPaid,
+                price: isPaid ? Math.max(0, Number.parseFloat(price) || 0) : 0,
+                upiId: isPaid ? upiId : null,
+                registrationLink,
+                target: {
+                    departments: targetBranches,
+                    years: targetYears.length ? targetYears : [1, 2, 3, 4],
+                },
+                bannerUrl: imageUri?.startsWith('http') ? imageUri : null,
+                capacity: capacity ? Number.parseInt(capacity, 10) : null,
+                hasCustomForm: useCustomForm,
+                customFormSchema: useCustomForm ? customFormSchema : [],
+                type: 'eventTemplate',
+                ownerId: user.uid,
+                ownerEmail: user.email,
+                organizerName: user.displayName || 'Club Admin',
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            };
+
+            const templateRef = doc(collection(db, 'eventTemplates'));
+            await setDoc(templateRef, templateData);
+
+            Alert.alert('Saved', 'Template saved successfully!');
+        } catch (error) {
+            console.error('Template save failed:', error);
+            Alert.alert('Error', 'Failed to save template.');
+        } finally {
+            setTemplateLoading(false);
+        }
+    };
 
     useEffect(() => {
         if (isEditMode) {
             setTitle(event.title);
             setDescription(event.description);
+            setSelectedTags(event.tags || []);
             setCategory(event.category);
             setLocation(event.location || '');
+            if (event.coordinates) setCoordinates(event.coordinates);
             setTargetBranches(event.target?.departments || ['All']);
             setTargetYears(event.target?.years || []);
             setStartDate(new Date(event.startAt));
@@ -165,13 +364,18 @@ export default function CreateEvent({ navigation, route }) {
             setRegistrationLink(event.registrationLink || '');
             setMaxParticipants(event.maxParticipants?.toString() || '');
             setImageUri(event.bannerUrl);
+            setCapacity(event.capacity?.toString() || '');
             setUseCustomForm(event.hasCustomForm);
             setCustomFormSchema(event.customFormSchema || []);
             navigation.setOptions({ title: 'Edit Event' });
+        } else if (template) {
+            applyTemplate(template);
         }
-    }, [isEditMode, event, navigation]);
+    }, [isEditMode, event, template, navigation]);
 
     const handleCreate = async () => {
+        if (loading) return;
+
         if (!title.trim() || !description.trim() || !category) {
             Alert.alert('Missing Info', 'Please fill Title, Description and Category.');
             return;
@@ -185,8 +389,24 @@ export default function CreateEvent({ navigation, route }) {
             return;
         }
 
+        if (endDate.getTime() <= startDate.getTime()) {
+            Alert.alert('Invalid Dates', 'End date must be after start date');
+            return;
+        }
         setLoading(true);
         try {
+            // Symmetrical, client-side rate-limiting checks prior to side-effects
+            try {
+                await enforceRateLimit(!isEditMode);
+            } catch (rateLimitErr) {
+                if (rateLimitErr.status === 429) {
+                    Alert.alert('Too Many Requests', rateLimitErr.message);
+                    setLoading(false);
+                    return;
+                }
+                throw rateLimitErr;
+            }
+
             let bannerUrl = imageUri;
             if (imageUri && imageUri !== event?.bannerUrl && !imageUri.startsWith('http')) {
                 // Only upload if changed and local file
@@ -203,24 +423,25 @@ export default function CreateEvent({ navigation, route }) {
             let generatedMeetLink = meetLink;
 
             if (eventMode === 'online' && !meetLink) {
-                generatedMeetLink = await handleGenerateMeetLink();
+                generatedMeetLink = await handleGenerateMeetLink({ allowWhileSubmitting: true });
             }
             if (eventMode === 'online' && !generatedMeetLink) {
-                setLoading(false);
                 return;
             }
 
             const eventData = {
                 title,
                 description,
+                tags: selectedTags,
                 location: eventMode === 'online' ? 'Google Meet' : location,
+                coordinates: eventMode === 'offline' && coordinates ? coordinates : null,
                 category,
                 eventMode,
                 meetLink: eventMode === 'online' ? generatedMeetLink : null,
                 startAt: startDate.toISOString(),
                 endAt: endDate.toISOString(),
                 isPaid,
-                price: isPaid ? price : '0',
+                price: isPaid ? Math.max(0, Number.parseFloat(price) || 0) : 0,
                 upiId: isPaid ? upiId : null,
                 registrationLink,
                 maxParticipants: maxParticipants ? parseInt(maxParticipants) : null,
@@ -229,6 +450,7 @@ export default function CreateEvent({ navigation, route }) {
                     years: targetYears.length ? targetYears : [1, 2, 3, 4],
                 },
                 bannerUrl,
+                capacity: capacity ? Number.parseInt(capacity, 10) : null,
                 hasCustomForm: useCustomForm,
                 customFormSchema: useCustomForm ? customFormSchema : [],
             };
@@ -237,14 +459,57 @@ export default function CreateEvent({ navigation, route }) {
                 await updateDoc(doc(db, 'events', event.id), eventData);
                 Alert.alert('Success', 'Event Updated!');
             } else {
-                await addDoc(collection(db, 'events'), {
-                    ...eventData,
-                    ownerId: user.uid,
-                    ownerEmail: user.email,
-                    organizerName: user.displayName || 'Club Admin',
-                    createdAt: new Date().toISOString(),
-                    status: 'active',
-                    appealStatus: null,
+                const eventRef = doc(collection(db, 'events'));
+                const attendancePlaceholderRef = doc(
+                    db,
+                    'events',
+                    eventRef.id,
+                    'attendance',
+                    'bootstrap',
+                );
+                const organizerRef = doc(db, 'users', user.uid);
+
+                await runTransaction(db, async transaction => {
+                    const organizerSnap = await transaction.get(organizerRef);
+
+                    transaction.set(eventRef, {
+                        ...eventData,
+                        participantCount: 0,
+                        branchCounts: {},
+                        yearCounts: {},
+                        participantsPreview: [],
+                        ownerId: user.uid,
+                        ownerEmail: user.email,
+                        organizerName: user.displayName || 'Club Admin',
+                        createdAt: serverTimestamp(),
+                        status: 'active',
+                        appealStatus: null,
+                    });
+
+                    transaction.set(attendancePlaceholderRef, {
+                        eventId: eventRef.id,
+                        ownerId: user.uid,
+                        type: 'bootstrap',
+                        checkInCount: 0,
+                        createdAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                    });
+
+                    if (organizerSnap.exists()) {
+                        transaction.update(organizerRef, {
+                            'organizerStats.eventsCreated': increment(1),
+                            lastEventCreatedAt: serverTimestamp(),
+                        });
+                    } else {
+                        transaction.set(
+                            organizerRef,
+                            {
+                                organizerStats: { eventsCreated: 1 },
+                                lastEventCreatedAt: serverTimestamp(),
+                            },
+                            { merge: true },
+                        );
+                    }
                 });
                 Alert.alert('Success', 'Event Created!');
             }
@@ -292,6 +557,7 @@ export default function CreateEvent({ navigation, route }) {
                     <input
                         type="datetime-local"
                         value={iso}
+                        disabled={loading}
                         onChange={e => setDate(new Date(e.target.value))}
                         style={{
                             padding: 10, // Shortened padding/height slightly
@@ -318,14 +584,13 @@ export default function CreateEvent({ navigation, route }) {
                         setDateMode('date');
                         setShowPicker(true);
                     }}
-                    style={styles.dateCard}
+                    style={[styles.dateCard, loading && styles.disabledControl]}
+                    disabled={loading}
                 >
                     <Ionicons name="calendar-outline" size={20} color={theme.colors.primary} />
                     <View>
-                        <Text style={styles.dateText}>{date.toLocaleDateString()}</Text>
-                        <Text style={styles.timeText}>
-                            {date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </Text>
+                        <Text style={styles.dateText}>{formatEventDate(date)}</Text>
+                        <Text style={styles.timeText}>{formatEventTime(date)}</Text>
                     </View>
                 </TouchableOpacity>
 
@@ -362,19 +627,63 @@ export default function CreateEvent({ navigation, route }) {
 
     return (
         <ScreenWrapper>
-            <View style={styles.header}>
-                <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-                    <Ionicons name="arrow-back" size={24} color={theme.colors.text} />
+            <View
+                style={[styles.header, { justifyContent: 'space-between', alignItems: 'center' }]}
+            >
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+                        <Ionicons name="arrow-back" size={24} color={theme.colors.text} />
+                    </TouchableOpacity>
+                    <Text style={styles.headerTitle}>
+                        {isEditMode ? 'Edit Event' : 'Create Event'}
+                    </Text>
+                </View>
+                <TouchableOpacity
+                    style={styles.headerPreviewBtn}
+                    onPress={() => setShowPreview(true)}
+                    disabled={loading}
+                    accessibilityLabel="Preview Event"
+                >
+                    <Ionicons name="eye-outline" size={24} color={theme.colors.primary} />
                 </TouchableOpacity>
-                <Text style={styles.headerTitle}>{isEditMode ? 'Edit Event' : 'Create Event'}</Text>
             </View>
 
             <ScrollView
                 contentContainerStyle={styles.scrollContent}
                 showsVerticalScrollIndicator={false}
             >
+                <View style={styles.templateActions}>
+                    {!isEditMode && (
+                        <TouchableOpacity
+                            style={[styles.templateBtn, templateLoading && styles.disabledControl]}
+                            onPress={fetchTemplates}
+                            disabled={loading || templateLoading}
+                        >
+                            <Ionicons name="copy-outline" size={18} color={theme.colors.primary} />
+                            <Text style={styles.templateBtnText}>
+                                {templateLoading ? 'Loading Templates...' : 'Use Template'}
+                            </Text>
+                        </TouchableOpacity>
+                    )}
+
+                    <TouchableOpacity
+                        style={[styles.templateBtn, templateLoading && styles.disabledControl]}
+                        onPress={saveAsTemplate}
+                        disabled={loading || templateLoading}
+                    >
+                        <Ionicons name="bookmark-outline" size={18} color={theme.colors.primary} />
+                        <Text style={styles.templateBtnText}>
+                            {templateLoading ? 'Saving...' : 'Save as Template'}
+                        </Text>
+                    </TouchableOpacity>
+                </View>
+
                 {/* Banner Picker - Immersive Style */}
-                <TouchableOpacity style={styles.bannerPicker} onPress={pickImage}>
+                <TouchableOpacity
+                    style={[styles.bannerPicker, loading && styles.disabledControl]}
+                    onPress={pickImage}
+                    disabled={loading}
+                >
                     {imageUri ? (
                         <Image source={{ uri: imageUri }} style={styles.bannerImage} />
                     ) : (
@@ -399,6 +708,7 @@ export default function CreateEvent({ navigation, route }) {
                         placeholder="e.g. Annual Tech Symposium"
                         value={title}
                         onChangeText={setTitle}
+                        disabled={loading}
                         icon={
                             <Ionicons name="text-outline" size={20} color={theme.colors.primary} />
                         }
@@ -410,7 +720,8 @@ export default function CreateEvent({ navigation, route }) {
                         value={description}
                         onChangeText={setDescription}
                         multiline
-                        style={{ height: 120 }} // Taller container for multiline
+                        style={{ height: 120 }}
+                        disabled={loading}
                         icon={
                             <Ionicons
                                 name="document-text-outline"
@@ -419,6 +730,34 @@ export default function CreateEvent({ navigation, route }) {
                             />
                         }
                     />
+
+                    {suggestedTags.length > 0 && (
+                        <View style={{ marginBottom: 16 }}>
+                            <Text style={[styles.label, { marginBottom: 8 }]}>Suggested Tags</Text>
+                            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+                                {suggestedTags.map(tag => {
+                                    const isSelected = selectedTags.includes(tag);
+                                    return (
+                                        <TouchableOpacity
+                                            key={tag}
+                                            onPress={() => toggleTag(tag)}
+                                            style={[styles.chip, isSelected && styles.chipActive]}
+                                            disabled={loading}
+                                        >
+                                            <Text
+                                                style={[
+                                                    styles.chipText,
+                                                    isSelected && styles.chipTextActive,
+                                                ]}
+                                            >
+                                                #{tag}
+                                            </Text>
+                                        </TouchableOpacity>
+                                    );
+                                })}
+                            </View>
+                        </View>
+                    )}
                 </View>
 
                 {/* Section 2: Logistics */}
@@ -456,8 +795,10 @@ export default function CreateEvent({ navigation, route }) {
                             style={[
                                 styles.segment,
                                 eventMode === 'offline' && styles.segmentActive,
+                                loading && styles.disabledControl,
                             ]}
                             onPress={() => setEventMode('offline')}
+                            disabled={loading}
                         >
                             <Text
                                 style={[
@@ -469,8 +810,13 @@ export default function CreateEvent({ navigation, route }) {
                             </Text>
                         </TouchableOpacity>
                         <TouchableOpacity
-                            style={[styles.segment, eventMode === 'online' && styles.segmentActive]}
+                            style={[
+                                styles.segment,
+                                eventMode === 'online' && styles.segmentActive,
+                                loading && styles.disabledControl,
+                            ]}
                             onPress={() => setEventMode('online')}
+                            disabled={loading}
                         >
                             <Text
                                 style={[
@@ -490,6 +836,7 @@ export default function CreateEvent({ navigation, route }) {
                                 placeholder="https://meet.google.com/..."
                                 value={meetLink}
                                 onChangeText={setMeetLink}
+                                disabled={loading}
                                 icon={
                                     <Ionicons
                                         name="link-outline"
@@ -499,9 +846,9 @@ export default function CreateEvent({ navigation, route }) {
                                 }
                             />
                             <TouchableOpacity
-                                style={styles.gmeetBtn}
+                                style={[styles.gmeetBtn, loading && styles.disabledControl]}
                                 onPress={handleGenerateMeetLink}
-                                disabled={!request}
+                                disabled={!request || loading}
                             >
                                 <Ionicons name="logo-google" size={20} color="#fff" />
                                 <Text style={styles.gmeetBtnText}>Auto-Generate Meet Link</Text>
@@ -514,6 +861,7 @@ export default function CreateEvent({ navigation, route }) {
                                 placeholder="e.g. Auditorium / Room 302"
                                 value={location}
                                 onChangeText={setLocation}
+                                disabled={loading}
                                 icon={
                                     <Ionicons
                                         name="location-outline"
@@ -522,6 +870,58 @@ export default function CreateEvent({ navigation, route }) {
                                     />
                                 }
                             />
+                            {MapView && (
+                                <View style={{ marginTop: 15 }}>
+                                    <Text style={[styles.label, { color: theme.colors.text }]}>
+                                        Pinpoint Exact Location
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            color: theme.colors.textSecondary,
+                                            marginBottom: 10,
+                                            fontSize: 12,
+                                        }}
+                                    >
+                                        Drag the map marker to set the exact coordinates for the
+                                        venue.
+                                    </Text>
+                                    <View
+                                        style={{
+                                            height: 200,
+                                            borderRadius: 12,
+                                            overflow: 'hidden',
+                                        }}
+                                    >
+                                        <MapView
+                                            style={{ flex: 1 }}
+                                            initialRegion={{
+                                                latitude: coordinates
+                                                    ? coordinates.latitude
+                                                    : 28.7041,
+                                                longitude: coordinates
+                                                    ? coordinates.longitude
+                                                    : 77.1025,
+                                                latitudeDelta: 0.005,
+                                                longitudeDelta: 0.005,
+                                            }}
+                                        >
+                                            <Marker
+                                                draggable
+                                                coordinate={
+                                                    coordinates || {
+                                                        latitude: 28.7041,
+                                                        longitude: 77.1025,
+                                                    }
+                                                }
+                                                onDragEnd={e =>
+                                                    !loading &&
+                                                    setCoordinates(e.nativeEvent.coordinate)
+                                                }
+                                            />
+                                        </MapView>
+                                    </View>
+                                </View>
+                            )}
                         </View>
                     )}
                 </View>
@@ -541,6 +941,7 @@ export default function CreateEvent({ navigation, route }) {
                                 key={cat}
                                 style={[styles.chip, category === cat && styles.chipActive]}
                                 onPress={() => setCategory(cat)}
+                                disabled={loading}
                             >
                                 <Text
                                     style={[
@@ -568,6 +969,7 @@ export default function CreateEvent({ navigation, route }) {
                                     targetBranches.includes(b) && styles.chipActive,
                                 ]}
                                 onPress={() => toggleBranch(b)}
+                                disabled={loading}
                             >
                                 <Text
                                     style={[
@@ -591,6 +993,7 @@ export default function CreateEvent({ navigation, route }) {
                                     targetYears.includes(y) && styles.yearChipActive,
                                 ]}
                                 onPress={() => toggleYear(y)}
+                                disabled={loading}
                             >
                                 <Text
                                     style={[
@@ -622,6 +1025,7 @@ export default function CreateEvent({ navigation, route }) {
                         <Switch
                             value={isPaid}
                             onValueChange={setIsPaid}
+                            disabled={loading}
                             trackColor={{ false: theme.colors.border, true: theme.colors.primary }}
                         />
                     </View>
@@ -634,6 +1038,7 @@ export default function CreateEvent({ navigation, route }) {
                                 value={price}
                                 onChangeText={setPrice}
                                 keyboardType="numeric"
+                                disabled={loading}
                                 icon={
                                     <Ionicons
                                         name="cash-outline"
@@ -648,6 +1053,7 @@ export default function CreateEvent({ navigation, route }) {
                                 value={upiId}
                                 onChangeText={setUpiId}
                                 autoCapitalize="none"
+                                disabled={loading}
                                 icon={
                                     <Ionicons
                                         name="wallet-outline"
@@ -665,6 +1071,7 @@ export default function CreateEvent({ navigation, route }) {
                             placeholder="External form link..."
                             value={registrationLink}
                             onChangeText={setRegistrationLink}
+                            disabled={loading}
                             icon={
                                 <Ionicons
                                     name="globe-outline"
@@ -693,7 +1100,71 @@ export default function CreateEvent({ navigation, route }) {
                     </View>
                 </View>
 
-                {/* Section 5: Custom Form */}
+                {/* Section 5: Capacity */}
+                <View style={styles.section}>
+                    <Text style={styles.sectionTitle}>Capacity</Text>
+                    <Text
+                        style={[
+                            styles.label,
+                            { color: theme.colors.textSecondary, marginBottom: 12 },
+                        ]}
+                    >
+                        Set a maximum attendee limit (optional)
+                    </Text>
+                    <PremiumInput
+                        label="Maximum Attendees"
+                        placeholder="e.g. 200"
+                        value={capacity}
+                        onChangeText={setCapacity}
+                        keyboardType="numeric"
+                        disabled={loading}
+                        icon={
+                            <Ionicons
+                                name="people-outline"
+                                size={20}
+                                color={theme.colors.primary}
+                            />
+                        }
+                    />
+                    {capacityWarning?.warning && (
+                        <View
+                            style={[
+                                styles.capacityWarning,
+                                {
+                                    backgroundColor:
+                                        capacityWarning.severity === 'high' ? '#fee2e2' : '#fef9c3',
+                                    borderColor:
+                                        capacityWarning.severity === 'high' ? '#fca5a5' : '#fcd34d',
+                                },
+                            ]}
+                        >
+                            <Ionicons
+                                name={
+                                    capacityWarning.severity === 'high'
+                                        ? 'warning'
+                                        : 'information-circle'
+                                }
+                                size={18}
+                                color={capacityWarning.severity === 'high' ? '#dc2626' : '#a16207'}
+                            />
+                            <Text
+                                style={[
+                                    styles.capacityWarningText,
+                                    {
+                                        color:
+                                            capacityWarning.severity === 'high'
+                                                ? '#991b1b'
+                                                : '#713f12',
+                                    },
+                                ]}
+                            >
+                                {capacityWarning.warning}
+                            </Text>
+                        </View>
+                    )}
+                </View>
+
+                {/* Section 6: Custom Form */}
                 <View style={styles.section}>
                     <View
                         style={[
@@ -710,6 +1181,7 @@ export default function CreateEvent({ navigation, route }) {
                         <Switch
                             value={useCustomForm}
                             onValueChange={setUseCustomForm}
+                            disabled={loading}
                             trackColor={{ false: theme.colors.border, true: theme.colors.primary }}
                         />
                     </View>
@@ -717,13 +1189,14 @@ export default function CreateEvent({ navigation, route }) {
                     {useCustomForm && (
                         <View style={{ marginTop: 15 }}>
                             <TouchableOpacity
-                                style={styles.formBuilderBtn}
+                                style={[styles.formBuilderBtn, loading && styles.disabledControl]}
                                 onPress={() =>
                                     navigation.navigate('FormBuilder', {
                                         initialSchema: customFormSchema,
                                         onSave: schema => setCustomFormSchema(schema),
                                     })
                                 }
+                                disabled={loading}
                             >
                                 <Ionicons
                                     name="construct-outline"
@@ -740,22 +1213,117 @@ export default function CreateEvent({ navigation, route }) {
                     )}
                 </View>
 
-                <TouchableOpacity
-                    style={[styles.createBtn, { opacity: loading ? 0.7 : 1 }]}
-                    onPress={handleCreate}
-                    disabled={loading}
-                >
-                    {loading ? (
-                        <ActivityIndicator color="#fff" />
-                    ) : (
-                        <Text style={styles.createBtnText}>
-                            {isEditMode ? 'Update Event' : 'Create Event'}
-                        </Text>
-                    )}
-                </TouchableOpacity>
+                <View style={styles.buttonRow}>
+                    <TouchableOpacity
+                        style={[styles.previewBtn, loading && styles.disabledControl]}
+                        onPress={() => setShowPreview(true)}
+                        disabled={loading}
+                    >
+                        <Ionicons name="eye-outline" size={20} color={theme.colors.primary} />
+                        <Text style={styles.previewBtnText}>Preview</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                        style={[styles.createBtn, { flex: 2, opacity: loading ? 0.7 : 1 }]}
+                        onPress={handleCreate}
+                        disabled={loading}
+                    >
+                        {loading ? (
+                            <View style={styles.submitLoadingContent}>
+                                <ActivityIndicator color="#fff" />
+                                <Text style={styles.createBtnText}>{submitLabel}</Text>
+                            </View>
+                        ) : (
+                            <Text style={styles.createBtnText}>{submitLabel}</Text>
+                        )}
+                    </TouchableOpacity>
+                </View>
 
                 <View style={{ height: 100 }} />
             </ScrollView>
+
+            <Modal
+                visible={templateModalVisible}
+                transparent
+                animationType="slide"
+                onRequestClose={() => setTemplateModalVisible(false)}
+            >
+                <View style={styles.modalOverlay}>
+                    <View style={styles.templateModal}>
+                        <View style={styles.templateModalHeader}>
+                            <View>
+                                <Text style={styles.templateModalTitle}>Event Templates</Text>
+                                <Text style={styles.templateModalSubtitle}>
+                                    Pick one to prefill this event.
+                                </Text>
+                            </View>
+                            <TouchableOpacity onPress={() => setTemplateModalVisible(false)}>
+                                <Ionicons name="close" size={24} color={theme.colors.text} />
+                            </TouchableOpacity>
+                        </View>
+
+                        <ScrollView showsVerticalScrollIndicator={false}>
+                            {templates.length === 0 ? (
+                                <View style={styles.emptyTemplates}>
+                                    <Ionicons
+                                        name="documents-outline"
+                                        size={32}
+                                        color={theme.colors.textSecondary}
+                                    />
+                                    <Text style={styles.emptyTemplatesText}>
+                                        No templates saved yet.
+                                    </Text>
+                                </View>
+                            ) : (
+                                templates.map(savedTemplate => (
+                                    <TouchableOpacity
+                                        key={savedTemplate.id}
+                                        style={styles.templateItem}
+                                        onPress={() => applyTemplate(savedTemplate)}
+                                    >
+                                        <View style={{ flex: 1 }}>
+                                            <Text style={styles.templateItemTitle}>
+                                                {savedTemplate.title}
+                                            </Text>
+                                            <Text style={styles.templateItemMeta}>
+                                                {savedTemplate.category || 'General'} -{' '}
+                                                {savedTemplate.eventMode || 'offline'}
+                                            </Text>
+                                        </View>
+                                        <Ionicons
+                                            name="chevron-forward"
+                                            size={18}
+                                            color={theme.colors.textSecondary}
+                                        />
+                                    </TouchableOpacity>
+                                ))
+                            )}
+                        </ScrollView>
+                    </View>
+                </View>
+            </Modal>
+
+            <EventPreview
+                visible={showPreview}
+                onClose={() => setShowPreview(false)}
+                organizerName={user?.displayName || 'Club Admin'}
+                eventData={{
+                    title,
+                    description,
+                    tags: selectedTags,
+                    category,
+                    location,
+                    startDate,
+                    endDate,
+                    eventMode,
+                    meetLink,
+                    isPaid,
+                    price,
+                    imageUri,
+                    targetBranches,
+                    targetYears,
+                }}
+            />
         </ScreenWrapper>
     );
 }
@@ -766,6 +1334,32 @@ const getStyles = theme =>
         backBtn: { marginRight: 15 },
         headerTitle: { fontSize: 24, fontWeight: 'bold', color: theme.colors.text },
         scrollContent: { padding: 20, paddingTop: 0 },
+
+        templateActions: {
+            flexDirection: 'row',
+            gap: 10,
+            marginBottom: 18,
+        },
+        templateBtn: {
+            flex: 1,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+            backgroundColor: theme.colors.surface,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            borderRadius: 12,
+            paddingVertical: 12,
+            paddingHorizontal: 10,
+            minHeight: 48,
+        },
+        templateBtnText: {
+            color: theme.colors.primary,
+            fontWeight: '700',
+            fontSize: 13,
+            textAlign: 'center',
+        },
 
         bannerPicker: {
             height: 200,
@@ -899,6 +1493,93 @@ const getStyles = theme =>
             elevation: 5,
         },
         createBtnText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+        submitLoadingContent: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 10,
+        },
+        disabledControl: {
+            opacity: 0.65,
+        },
+
+        modalOverlay: {
+            flex: 1,
+            justifyContent: 'flex-end',
+            backgroundColor: 'rgba(0,0,0,0.45)',
+        },
+        templateModal: {
+            maxHeight: '72%',
+            backgroundColor: theme.colors.background,
+            borderTopLeftRadius: 20,
+            borderTopRightRadius: 20,
+            padding: 20,
+        },
+        templateModalHeader: {
+            flexDirection: 'row',
+            alignItems: 'flex-start',
+            justifyContent: 'space-between',
+            gap: 16,
+            marginBottom: 16,
+        },
+        templateModalTitle: {
+            color: theme.colors.text,
+            fontSize: 20,
+            fontWeight: '800',
+        },
+        templateModalSubtitle: {
+            color: theme.colors.textSecondary,
+            fontSize: 13,
+            marginTop: 4,
+        },
+        emptyTemplates: {
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingVertical: 36,
+            gap: 10,
+        },
+        emptyTemplatesText: {
+            color: theme.colors.textSecondary,
+            fontWeight: '600',
+        },
+        templateItem: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 12,
+            backgroundColor: theme.colors.surface,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            borderRadius: 12,
+            padding: 14,
+            marginBottom: 10,
+        },
+        templateItemTitle: {
+            color: theme.colors.text,
+            fontWeight: '800',
+            fontSize: 15,
+        },
+        templateItemMeta: {
+            color: theme.colors.textSecondary,
+            fontSize: 12,
+            marginTop: 4,
+            textTransform: 'capitalize',
+        },
+
+        // Capacity Warning
+        capacityWarning: {
+            flexDirection: 'row',
+            alignItems: 'flex-start',
+            gap: 8,
+            padding: 12,
+            borderRadius: 12,
+            marginTop: 12,
+            borderWidth: 1,
+        },
+        capacityWarningText: {
+            fontSize: 13,
+            lineHeight: 18,
+            flex: 1,
+        },
 
         // Form Builder Btn
         formBuilderBtn: {
@@ -914,6 +1595,37 @@ const getStyles = theme =>
             borderStyle: 'dashed',
         },
         formBuilderText: { color: theme.colors.primary, fontWeight: 'bold' },
+        headerPreviewBtn: {
+            padding: 8,
+            borderRadius: 20,
+            backgroundColor: theme.colors.surface,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            alignItems: 'center',
+            justifyContent: 'center',
+        },
+        buttonRow: {
+            flexDirection: 'row',
+            gap: 12,
+            marginTop: 10,
+        },
+        previewBtn: {
+            flex: 1,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+            backgroundColor: theme.colors.surface,
+            borderWidth: 1.5,
+            borderColor: theme.colors.primary,
+            borderRadius: 16,
+            paddingVertical: 14,
+        },
+        previewBtnText: {
+            color: theme.colors.primary,
+            fontSize: 16,
+            fontWeight: 'bold',
+        },
     });
 
 CreateEvent.propTypes = {

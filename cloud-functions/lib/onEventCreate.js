@@ -36,10 +36,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.onEventCreate = void 0;
 const admin = __importStar(require("firebase-admin"));
 const functions = __importStar(require("firebase-functions"));
+const firestore_1 = require("firebase-admin/firestore");
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
 exports.onEventCreate = functions.firestore
-    .document("events/{eventId}")
+    .document('events/{eventId}')
     .onCreate(async (snapshot, context) => {
     const eventId = context.params.eventId;
     const eventData = snapshot.data();
@@ -70,8 +71,8 @@ exports.onEventCreate = functions.firestore
             title: 'New Event Alert! 📢',
             body: `Check out: "${eventData.title}"`,
             eventId: eventId,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            read: false
+            createdAt: firestore_1.FieldValue.serverTimestamp(),
+            read: false,
         });
         // 2. Push Notification
         const pushToken = userData.pushToken;
@@ -94,10 +95,9 @@ exports.onEventCreate = functions.firestore
                 await expo.sendPushNotificationsAsync(chunk);
             }
             catch (error) {
-                console.error("Error sending chunks", error);
+                console.error('Error sending chunks', error);
             }
         }
     }
     console.log(`Sent notifications to ${usersSnapshot.size} users.`);
 });
-//# sourceMappingURL=onEventCreate.js.map
