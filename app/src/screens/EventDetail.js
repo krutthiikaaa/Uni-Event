@@ -60,6 +60,9 @@ export default function EventDetail({ route, navigation }) {
     const [sendingCertificates, setSendingCertificates] = useState(false);
     const [rsvpStatus, setRsvpStatus] = useState(null);
     const [participantCount, setParticipantCount] = useState(0);
+    const [waitlistStatus, setWaitlistStatus] = useState(null);
+    const [waitlistPosition, setWaitlistPosition] = useState(null);
+    const [waitlistCount, setWaitlistCount] = useState(0);
     const [hasGivenFeedback, setHasGivenFeedback] = useState(false);
     const [showFeedbackModal, setShowFeedbackModal] = useState(false);
     const [showAppealModal, setShowAppealModal] = useState(false);
@@ -183,6 +186,26 @@ export default function EventDetail({ route, navigation }) {
             },
         );
 
+        const unsubWaitlist = onSnapshot(
+            collection(db, `events/${eventId}/waitlist`),
+            snapshot => {
+                setWaitlistCount(snapshot.size);
+                if (user) {
+                    const myDoc = snapshot.docs.find(d => d.id === user.uid);
+                    if (myDoc) {
+                        setWaitlistStatus('waitlisted');
+                        // Calculate position based on joinedAt
+                        const sortedDocs = snapshot.docs.sort((a, b) => new Date(a.data().joinedAt) - new Date(b.data().joinedAt));
+                        const pos = sortedDocs.findIndex(d => d.id === user.uid) + 1;
+                        setWaitlistPosition(pos);
+                    } else {
+                        setWaitlistStatus(null);
+                        setWaitlistPosition(null);
+                    }
+                }
+            }
+        );
+
         if (user) {
             getDoc(doc(db, `events/${eventId}/feedback`, user.uid)).then(snap => {
                 if (snap.exists()) setHasGivenFeedback(true);
@@ -213,6 +236,7 @@ export default function EventDetail({ route, navigation }) {
         return () => {
             unsubEvent();
             unsubParticipants();
+            unsubWaitlist();
         };
     }, [eventId, user, navigation]);
 
@@ -346,14 +370,15 @@ export default function EventDetail({ route, navigation }) {
             return;
         }
 
-        // 1. Custom Form Logic (if not already going and custom form exists)
-        if (event.hasCustomForm && event.customFormSchema?.length > 0 && rsvpStatus !== 'going') {
+        // 1. Custom Form Logic
+        if (event.hasCustomForm && event.customFormSchema?.length > 0 && rsvpStatus !== 'going' && waitlistStatus !== 'waitlisted') {
             navigation.navigate('EventRegistrationForm', { event });
             return;
         }
 
         // 2. Paid Event Logic
-        if (event.isPaid && rsvpStatus !== 'going') {
+        const isFull = event.maxParticipants && participantCount >= event.maxParticipants;
+        if (event.isPaid && rsvpStatus !== 'going' && waitlistStatus !== 'waitlisted' && !isFull) {
             if (event.registrationLink) {
                 Alert.alert('External Registration', 'This event requires external registration.', [
                     { text: 'Cancel', style: 'cancel' },
@@ -375,6 +400,7 @@ export default function EventDetail({ route, navigation }) {
 
     const performRsvp = async () => {
         const ref = doc(db, 'events', eventId, 'participants', user.uid);
+        const waitlistRef = doc(db, 'events', eventId, 'waitlist', user.uid);
         const userRef = doc(db, 'users', user.uid, 'participating', eventId);
         const userProfileRef = doc(db, 'users', user.uid);
 
@@ -387,34 +413,53 @@ export default function EventDetail({ route, navigation }) {
                     'Withdrawn',
                     `You are no longer registered. (-${RSVP_POINTS_CHANGE} Points)`,
                 );
+            } else if (waitlistStatus === 'waitlisted') {
+                await deleteDoc(waitlistRef);
+                Alert.alert('Removed', 'You have been removed from the waitlist.');
             } else {
                 const userDoc = await getDoc(userProfileRef);
                 const userData = userDoc.exists() ? userDoc.data() : {};
+                const isFull = event.maxParticipants && participantCount >= event.maxParticipants;
 
-                await setDoc(ref, {
-                    userId: user.uid,
-                    email: user.email,
-                    name: user.displayName || 'Anonymous',
-                    branch: userData.branch || 'Unknown',
-                    year: userData.year || 'Unknown',
-                    joinedAt: new Date().toISOString(),
-                });
-                await setDoc(userRef, { eventId: eventId, joinedAt: new Date().toISOString() });
+                if (isFull) {
+                    await setDoc(waitlistRef, {
+                        userId: user.uid,
+                        email: user.email,
+                        name: user.displayName || 'Anonymous',
+                        branch: userData.branch || 'Unknown',
+                        year: userData.year || 'Unknown',
+                        joinedAt: new Date().toISOString(),
+                    });
+                    Alert.alert(
+                        'Waitlisted! ⏳',
+                        `The event is full. You have been added to the waitlist. We will notify you if a spot opens up.`,
+                    );
+                } else {
+                    await setDoc(ref, {
+                        userId: user.uid,
+                        email: user.email,
+                        name: user.displayName || 'Anonymous',
+                        branch: userData.branch || 'Unknown',
+                        year: userData.year || 'Unknown',
+                        joinedAt: new Date().toISOString(),
+                    });
+                    await setDoc(userRef, { eventId: eventId, joinedAt: new Date().toISOString() });
 
-                const earlyBird = ebInfo?.isEligible;
-                const userUpdate = { points: increment(RSVP_POINTS_CHANGE) };
-                if (earlyBird) {
-                    userUpdate.badges = arrayUnion(`early_bird_${eventId}`);
+                    const earlyBird = ebInfo?.isEligible;
+                    const userUpdate = { points: increment(RSVP_POINTS_CHANGE) };
+                    if (earlyBird) {
+                        userUpdate.badges = arrayUnion(`early_bird_${eventId}`);
+                    }
+                    await updateDoc(userProfileRef, userUpdate);
+
+                    await scheduleEventReminder(event);
+                    Alert.alert(
+                        'Registered! 🎉',
+                        earlyBird
+                            ? `You earned +${RSVP_POINTS_CHANGE} Points and the 🐦 Early Bird badge for being one of the first to RSVP!`
+                            : `You earned +${RSVP_POINTS_CHANGE} Points for registering.`,
+                    );
                 }
-                await updateDoc(userProfileRef, userUpdate);
-
-                await scheduleEventReminder(event);
-                Alert.alert(
-                    'Registered! 🎉',
-                    earlyBird
-                        ? `You earned +${RSVP_POINTS_CHANGE} Points and the 🐦 Early Bird badge for being one of the first to RSVP!`
-                        : `You earned +${RSVP_POINTS_CHANGE} Points for registering.`,
-                );
             }
         } catch (e) {
             console.error('RSVP Error: ', e);
@@ -1890,13 +1935,14 @@ export default function EventDetail({ route, navigation }) {
                 <View style={[styles.fabContainer, { backgroundColor: theme.colors.surface }]}>
                     <View style={styles.fabSubInfo}>
                         <Text style={styles.fabLabel}>Attending</Text>
-                        <Text style={styles.fabValue}>{participantCount} People</Text>
+                        <Text style={styles.fabValue}>{participantCount} People {event.maxParticipants ? `/ ${event.maxParticipants}` : ''}</Text>
+                        {waitlistCount > 0 && <Text style={{fontSize: 10, color: theme.colors.textSecondary}}>{waitlistCount} Waitlisted</Text>}
                     </View>
 
                     <TouchableOpacity
                         style={[
                             styles.primaryBtn,
-                            rsvpStatus === 'going' && styles.secondaryBtn,
+                            (rsvpStatus === 'going' || waitlistStatus === 'waitlisted') && styles.secondaryBtn,
                             new Date(event.endAt) < new Date() &&
                                 !(rsvpStatus === 'going' && event.certificatesSent) && {
                                     backgroundColor: theme.colors.textSecondary,
@@ -1918,7 +1964,7 @@ export default function EventDetail({ route, navigation }) {
                         <Text
                             style={[
                                 styles.primaryBtnText,
-                                rsvpStatus === 'going' && styles.secondaryBtnText,
+                                (rsvpStatus === 'going' || waitlistStatus === 'waitlisted') && styles.secondaryBtnText,
                                 new Date(event.endAt) < new Date() &&
                                     !(rsvpStatus === 'going' && event.certificatesSent) && {
                                         color: '#fff',
@@ -1933,9 +1979,13 @@ export default function EventDetail({ route, navigation }) {
                                     : 'Closed'
                                 : rsvpStatus === 'going'
                                   ? 'Registered ✓'
-                                  : event.isPaid
-                                    ? `Book Ticket (₹${event.price})`
-                                    : 'RSVP Now'}
+                                  : waitlistStatus === 'waitlisted'
+                                    ? `Waitlist #${waitlistPosition}`
+                                    : event.maxParticipants && participantCount >= event.maxParticipants
+                                      ? 'Join Waitlist'
+                                      : event.isPaid
+                                        ? `Book Ticket (₹${event.price})`
+                                        : 'RSVP Now'}
                         </Text>
                     </TouchableOpacity>
                 </View>
