@@ -11,7 +11,7 @@ export * from './onEventCreate';
 export * from './reminders';
 export * from './reputation';
 export * from './setRole';
-export * from "./inactiveUsers";
+export * from './inactiveUsers';
 export * from './waitlist';
 
 export const cleanupRateLimits = functions.pubsub.schedule('every 1 hour').onRun(async () => {
